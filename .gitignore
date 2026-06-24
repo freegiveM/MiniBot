@@ -209,6 +209,34 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# MiniBot local references, runtime state, and private planning artifacts
+pico/
+.pico/
+.minibot/
+referenceMaterial/
+
+# Local-only planning / interview preparation
+Note/
+docs/*spec*.md
+docs/review-pack/
+minibot-resume-star-rewrite.local.md
+*.local.md
+*.local.json
+
+# Generated benchmark / evaluation artifacts
+artifacts/
+benchmark-artifacts/
+benchmarks/benchmark-*.json
+benchmarks/*-artifact*.json
+workspaces/
+
+# Agent scratch outputs
+.memory/
+.transcripts/
+.task_outputs/
+*.trace.jsonl
+*.report.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

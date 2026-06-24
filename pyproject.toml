@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minibot"
+version = "0.1.0"
+description = "Lightweight local coding agent with auditable memory and runtime state"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+minibot = "minibot.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["minibot"]
+
