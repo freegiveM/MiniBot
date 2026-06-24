@@ -27,6 +27,7 @@ from .task_state import (
     STOP_REASON_TOOL_ERROR,
     TaskState,
 )
+from .todo_state import TodoState
 from . import tools as toolkit
 from .workspace import clip, now
 
@@ -88,6 +89,7 @@ class MiniBot:
         self.session = session or self._new_session()
         self._ensure_session_shape()
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        self.todo_state = TodoState.from_dict(self.session.get("todo_state", {}))
         self.tools = toolkit.build_tool_registry(self)
         self.permission_pipeline = PermissionPipeline(
             self.root,
@@ -117,6 +119,7 @@ class MiniBot:
             "turn_count": 0,
             "history": [],
             "memory": memorylib.default_memory_state(),
+            "todo_state": {"items": []},
             "runs": {"last_run_id": "", "recent_run_ids": []},
             "memory_maintenance": {
                 "pending_store": ".minibot/memory/pending.jsonl",
@@ -132,6 +135,7 @@ class MiniBot:
         for key, value in default.items():
             self.session.setdefault(key, value)
         self.session["memory"] = memorylib.normalize_memory_state(self.session.get("memory"), self.root)
+        self.session["todo_state"] = TodoState.from_dict(self.session.get("todo_state", {})).to_dict()
         self.session.pop("checkpoints", None)
         self.session.setdefault("runs", {"last_run_id": "", "recent_run_ids": []})
         self.session.setdefault("pending_delegates", [])
@@ -177,6 +181,11 @@ class MiniBot:
 
     def record(self, item: dict) -> None:
         self.session.setdefault("history", []).append(item)
+        self.session["updated_at"] = now()
+        self.session_path = self.session_store.save(self.session)
+
+    def persist_todo_state(self) -> None:
+        self.session["todo_state"] = self.todo_state.to_dict()
         self.session["updated_at"] = now()
         self.session_path = self.session_store.save(self.session)
 
@@ -409,6 +418,7 @@ class MiniBot:
     def build_report(self, task_state: TaskState) -> dict:
         return {
             "task_state": task_state.to_dict(),
+            "todo_state": self.todo_state.to_dict(),
             "session_id": self.session.get("id", ""),
             "prompt_metadata": self.last_prompt_metadata,
             "memory": {

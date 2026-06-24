@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .todo_state import TodoState
 from .workspace import IGNORED_PATH_NAMES, clip
 
 
@@ -189,6 +190,11 @@ BASE_TOOL_SPECS = {
         description="Replace one exact text block.",
         schema={"path": "str", "old_text": "str", "new_text": "str"},
         risk_level=RISK_LEVEL_RISKY,
+    ),
+    "todo_write": ToolSpec(
+        name="todo_write",
+        description="Replace the current task plan. Tracks planning only and does not execute tasks.",
+        schema={"items_json": "str"},
     ),
     "delegate": ToolSpec(
         name="delegate",
@@ -371,6 +377,8 @@ def _validate_tool_call(agent, name: str, args: dict) -> None:
         count = path.read_text(encoding="utf-8").count(old_text)
         if count != 1:
             raise ValueError(f"old_text must occur exactly once, found {count}")
+    elif name == "todo_write":
+        TodoState().set_items(_todo_items_from_args(args))
     elif name == "delegate":
         if agent.depth >= agent.max_depth:
             raise ValueError("delegate depth exceeded")
@@ -380,6 +388,19 @@ def _validate_tool_call(agent, name: str, args: dict) -> None:
             raise ValueError("max_steps must be positive")
     else:
         raise ValueError(f"unknown tool: {name}")
+
+
+def _todo_items_from_args(args: dict) -> list:
+    raw = _required_str(args, "items_json")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"items_json must be valid JSON: {exc}") from exc
+    if isinstance(payload, dict) and "items" in payload:
+        payload = payload["items"]
+    if not isinstance(payload, list):
+        raise ValueError("items_json must encode a list of todo items")
+    return payload
 
 
 def tool_list_files(agent, args: dict) -> str:
@@ -493,6 +514,18 @@ def tool_patch_file(agent, args: dict) -> str:
     return f"patched {path.relative_to(agent.root)}"
 
 
+def tool_todo_write(agent, args: dict) -> ToolObservation:
+    items = _todo_items_from_args(args)
+    agent.todo_state.set_items(items)
+    agent.persist_todo_state()
+    summary = agent.todo_state.summary()
+    return ToolObservation(
+        status=OBSERVATION_SUCCEEDED,
+        content=agent.todo_state.render_for_prompt(),
+        metadata={"todo_summary": summary},
+    )
+
+
 def tool_delegate(agent, args: dict) -> str:
     from .runtime import MiniBot
 
@@ -520,5 +553,6 @@ _TOOL_RUNNERS = {
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
+    "todo_write": tool_todo_write,
     "delegate": tool_delegate,
 }
