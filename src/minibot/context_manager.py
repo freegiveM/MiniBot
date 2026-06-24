@@ -326,6 +326,9 @@ class ContextManager:
         for key in keys:
             value = snapshot.get(key, "")
             lines.append(f"- {key}: {value if value not in ('', None) else '-'}")
+        todo_state = getattr(self.agent, "todo_state", None)
+        if todo_state is not None and getattr(todo_state, "items", []):
+            lines.extend(todo_state.render_for_prompt().splitlines())
         return "\n".join(lines)
 
     def _render_working_memory(self) -> str:
