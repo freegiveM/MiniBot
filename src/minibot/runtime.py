@@ -277,6 +277,8 @@ class MiniBot:
             prompt, prompt_metadata = self.context_manager.build(user_message)
             self.last_prompt_metadata = prompt_metadata
             self.emit_trace(task_state, "prompt_built", {"prompt_metadata": prompt_metadata})
+            if prompt_metadata.get("compact_summary"):
+                self.emit_trace(task_state, "context_compacted", {"compact_summary": prompt_metadata["compact_summary"]})
             try:
                 raw = self.model_client.complete(prompt, self.max_new_tokens)
             except Exception as exc:

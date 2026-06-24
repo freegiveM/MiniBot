@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from minibot import FakeModelClient, MiniBot, SessionStore, WorkspaceContext
+from minibot.context_manager import ContextManager
 from minibot.runtime import SESSION_TOOL_OBSERVATION_LIMIT
 from minibot.task_state import (
     STATUS_COMPLETED,
@@ -164,6 +165,25 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(state["status"], STATUS_FAILED)
             self.assertEqual(state["stop_reason"], STOP_REASON_MODEL_ERROR)
             self.assertTrue(any(event["event"] == "model_error" for event in self.load_trace_events(root, run_id)))
+
+    def test_runtime_records_context_compacted_trace_and_report_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root, ["<final>Done.</final>"])
+            agent.session["history"] = [{"role": "assistant", "content": "old context " + ("x" * 2500)}]
+            agent.context_manager = ContextManager(agent, total_budget=1200)
+
+            self.assertEqual(agent.ask("latest request"), "Done.")
+
+            run_id = agent.session["runs"]["last_run_id"]
+            events = self.load_trace_events(root, run_id)
+            compact_events = [event for event in events if event["event"] == "context_compacted"]
+            report = json.loads((root / ".minibot" / "runs" / run_id / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(compact_events), 1)
+            self.assertEqual(compact_events[0]["compact_summary"]["trigger"], "prompt_budget_exceeded")
+            self.assertEqual(report["prompt_metadata"]["compact_summary"]["trigger"], "prompt_budget_exceeded")
+            self.assertTrue(report["prompt_metadata"]["current_request_preserved"])
 
 
 if __name__ == "__main__":

@@ -97,6 +97,158 @@ class ContextManagerTests(unittest.TestCase):
             self.assertIn("- last_tool: read_file", prompt)
             self.assertEqual(metadata["sections"]["task_state"]["source"], "runtime.current_task_state")
 
+    def test_context_compaction_preserves_current_request(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+            agent.session["history"] = [
+                {"role": "assistant", "content": f"older context {index} " + ("x" * 500)}
+                for index in range(8)
+            ]
+            request = "latest request must remain exactly"
+            context = ContextManager(agent, total_budget=1200)
+
+            prompt, metadata = context.build_prompt(request)
+
+            self.assertTrue(prompt.endswith("Current user request:\n" + request))
+            self.assertTrue(metadata["current_request_preserved"])
+            self.assertGreater(metadata["budget_reduction_count"], 0)
+            self.assertEqual(metadata["compact_trigger"], "prompt_budget_exceeded")
+            self.assertFalse(metadata["sections"]["identity"]["truncated"])
+            self.assertFalse(metadata["sections"]["tools"]["truncated"])
+            self.assertFalse(metadata["sections"]["task_state"]["truncated"])
+            self.assertFalse(metadata["sections"]["current_request"]["truncated"])
+
+    def test_history_trimming_prefers_old_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+            agent.session["history"] = [
+                {"role": "assistant", "content": "OLD_MARKER_0 " + ("x" * 300)},
+                {"role": "assistant", "content": "OLD_MARKER_1 " + ("x" * 300)},
+                {"role": "assistant", "content": "OLD_MARKER_2 " + ("x" * 300)},
+                {"role": "assistant", "content": "NEW_MARKER_KEEP"},
+            ]
+            _, raw_metadata = ContextManager(agent, total_budget=None).build_prompt("continue")
+            budget = raw_metadata["raw_prompt_chars"] - raw_metadata["sections"]["history"]["chars"] + 260
+
+            prompt, metadata = ContextManager(agent, total_budget=budget).build_prompt("continue")
+
+            self.assertNotIn("OLD_MARKER_0", prompt)
+            self.assertIn("NEW_MARKER_KEEP", prompt)
+            history_event = metadata["compact_summary"]["events"][0]
+            self.assertEqual(history_event["section"], "history")
+            self.assertGreater(history_event["trimmed_history_items"], 0)
+
+    def test_duplicate_read_observations_are_collapsed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+            agent.session["history"] = [
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "args": {"path": "app.py", "start": 1, "end": 50},
+                    "content": "OLD_DUPLICATE_READ_CONTENT " + ("x" * 900),
+                    "metadata": {"artifact_ref": "runs/run_old/trace.jsonl", "content_chars": 925},
+                },
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "args": {"path": "app.py", "start": 1, "end": 80},
+                    "content": "LATEST_READ_CONTENT",
+                    "metadata": {"artifact_ref": "runs/run_new/trace.jsonl", "content_chars": 19},
+                },
+            ]
+            _, raw_metadata = ContextManager(agent, total_budget=None).build_prompt("continue")
+            budget = raw_metadata["raw_prompt_chars"] - raw_metadata["sections"]["history"]["chars"] + 900
+
+            prompt, metadata = ContextManager(agent, total_budget=budget).build_prompt("continue")
+
+            self.assertIn("duplicate read_file collapsed for app.py", prompt)
+            self.assertIn("LATEST_READ_CONTENT", prompt)
+            self.assertNotIn("OLD_DUPLICATE_READ_CONTENT", prompt)
+            self.assertIn("runs/run_old/trace.jsonl", prompt)
+            history_event = metadata["compact_summary"]["events"][0]
+            self.assertGreater(history_event["collapsed_duplicate_reads"], 0)
+
+    def test_tool_observation_compaction_keeps_artifact_ref(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+            agent.session["history"] = [
+                {
+                    "role": "tool",
+                    "name": "search",
+                    "args": {"query": "needle"},
+                    "content": "SEARCH_PREVIEW " + ("x" * 1000) + " TAIL_SHOULD_COMPACT",
+                    "metadata": {
+                        "artifact_ref": "runs/run_1/trace.jsonl",
+                        "content_chars": 2048,
+                        "tool_status": "succeeded",
+                        "truncated": True,
+                    },
+                }
+            ]
+            _, raw_metadata = ContextManager(agent, total_budget=None).build_prompt("continue")
+            budget = raw_metadata["raw_prompt_chars"] - raw_metadata["sections"]["history"]["chars"] + 900
+
+            prompt, metadata = ContextManager(agent, total_budget=budget).build_prompt("continue")
+
+            self.assertIn("Observation summary:", prompt)
+            self.assertIn("SEARCH_PREVIEW", prompt)
+            self.assertNotIn("TAIL_SHOULD_COMPACT", prompt)
+            self.assertIn("runs/run_1/trace.jsonl", prompt)
+            self.assertIn("- original_chars: 2048", prompt)
+            history_event = metadata["compact_summary"]["events"][0]
+            self.assertGreater(history_event["summarized_tool_observations"], 0)
+
+    def test_compact_summary_records_trigger_sections_and_reduction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+            agent.session["history"] = [{"role": "assistant", "content": "x" * 2000}]
+
+            _, metadata = ContextManager(agent, total_budget=1200).build_prompt("continue")
+
+            summary = metadata["compact_summary"]
+            self.assertEqual(summary["trigger"], "prompt_budget_exceeded")
+            self.assertGreater(summary["raw_prompt_chars"], summary["final_prompt_chars"])
+            self.assertGreater(summary["reduced_chars"], 0)
+            self.assertTrue(summary["current_request_preserved"])
+            self.assertFalse(summary["summarizer"]["used"])
+            self.assertEqual(metadata["budget_reduction_count"], len(summary["events"]))
+            self.assertTrue(any(event["section"] == "history" for event in summary["events"]))
+
+    def test_compaction_trims_relevant_memory_before_memory_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            memory_dir = root / ".minibot" / "memory"
+            memory_dir.mkdir(parents=True)
+            (memory_dir / "MEMORY.md").write_text("INDEX_MARKER " + ("i" * 1000), encoding="utf-8")
+            agent = self.build_agent(root)
+            for index in range(3):
+                agent.memory.append_note(
+                    "signal relevant memory note " + str(index) + " " + ("r" * 450),
+                    tags=("signal",),
+                    topic="task-experience",
+                )
+            _, raw_metadata = ContextManager(agent, total_budget=None).build_prompt("signal")
+            budget = raw_metadata["raw_prompt_chars"] - raw_metadata["sections"]["relevant_memory"]["chars"] + 700
+
+            prompt, metadata = ContextManager(agent, total_budget=budget).build_prompt("signal")
+
+            self.assertEqual(metadata["compact_summary"]["events"][0]["section"], "relevant_memory")
+            self.assertTrue(metadata["sections"]["relevant_memory"]["truncated"])
+            self.assertFalse(metadata["sections"]["memory_index"]["truncated"])
+            self.assertIn("INDEX_MARKER", prompt)
+
     def test_prompt_metadata_reaches_trace_and_report(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
