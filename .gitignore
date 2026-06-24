@@ -210,6 +210,7 @@ tempCodeRunnerFile.py
 .pypirc
 
 # MiniBot local references, runtime state, and private planning artifacts
+.codex/
 pico/
 .pico/
 .minibot/
