@@ -7,14 +7,14 @@ must not be committed as project source.
 ## Project Goal
 
 MiniBot is a lightweight local coding agent for repository inspection,
-modification, debugging, review, checkpoint recovery, memory-assisted context,
+modification, debugging, review, session-based resume, memory-assisted context,
 and regression evaluation.
 
 The refactor should keep Pico's useful chain:
 
 ```text
 user request -> prompt build -> model decision -> tool execution ->
-history/trace/task_state/report -> checkpoint/session persistence
+history/trace/task_state/report -> session persistence
 ```
 
 But the memory design must follow the v2 optimization plan:
@@ -35,7 +35,8 @@ accuracy first, source facts from source files, memory as guidance
 6. Keep the runtime loop explicit. Model calls, tool execution, history writes,
    final responses, and safety checks must stay on the main path.
 7. Use hooks only for side effects such as trace metadata, file access updates,
-   candidate memory generation, phase updates, and maintenance.
+   candidate memory generation, and maintenance. Hooks must not be the source of
+   truth for run lifecycle state.
 8. A normal `read_file` result may update file access metadata, but must not
    create durable memory, candidate memory, or episodic notes by default.
 9. Local runtime artifacts stay under `.minibot/` or `.pico/` style state
@@ -105,6 +106,21 @@ verbatim; keep MiniBot's own structure and language.
 ## Session Contract
 
 Session state is a recovery container, not a knowledge base.
+MVP resume loads session state and injects bounded history, working memory,
+memory index, and workspace context. Do not add checkpoint state in the MVP;
+snapshot-based recovery must be designed later as a context-compaction feature
+with its own schema and tests.
+
+State ownership is split deliberately:
+
+- `SessionStore` is the resume source of truth. `MiniBot.from_session(...)` must
+  be able to rebuild prompt context from session data without reading previous
+  run artifacts.
+- `RunStore` is the evaluation and audit source of truth. Evaluators should read
+  `runs/<run_id>/task_state.json`, `trace.jsonl`, and `report.json`, not session
+  history.
+- Session `runs` fields are navigation pointers only, such as last/recent run
+  ids. They must not become hidden recovery payloads.
 
 Allowed session fields:
 
@@ -117,7 +133,6 @@ Allowed session fields:
 - `memory.file_access`
 - `memory.episodic_notes`
 - `memory.durable_cache`
-- `checkpoints`
 - `runs`
 - `memory_maintenance`
 - `pending_delegates`
@@ -129,34 +144,12 @@ Disallowed session fields:
 - unbounded raw tool output
 - pending candidate bodies embedded directly in session
 
-## Phase Contract
-
-Use a fixed enum:
-
-```text
-intake, inspect, plan, implement, verify, debug, finalize, blocked
-```
-
-The runtime owns phase updates. The model may suggest a phase, but may not write
-free-form phase values.
-
-Expected transitions:
-
-- new user request -> `intake` or `inspect`
-- list/read/search/delegate -> `inspect`
-- write/patch -> `implement`
-- test/build/compile shell command -> `verify`
-- tool error or partial success -> `debug`
-- rejected action, denied approval, path escape, schema mismatch -> `blocked`
-- normal final answer -> `finalize`
-
 ## Memory Contract
 
 Working memory should contain:
 
 - initial request summary
 - current task summary
-- current phase and phase reason
 - constraints
 - recent files
 - recent tools
@@ -185,30 +178,43 @@ Candidate memory belongs in `memory/pending.jsonl`, not in session.
 
 ## Retrieval Contract
 
-Build a lightweight retrieval context from:
+Relevant memory should follow the learn-claude-code style design:
 
-- current user request
-- task summary
-- current phase
-- recent files
-- recent tools
-- file access paths and symbols
+- keep a compact `MEMORY.md` index in prompt
+- build a memory catalog from topic name and short description
+- ask a side-query model step to select at most five relevant memory topics or
+  entries for the current turn
+- inject only bounded excerpts into the prompt
+- fall back to deterministic keyword/path matching when the side-query fails
 
-Primary scoring signals:
+Do not make hand-tuned weights the primary retrieval mechanism. Path, symbol,
+keyword, tag, recency, and hit-count signals may be used for fallback,
+re-ranking, observability, and ablation reports only.
 
-- path match
-- symbol match
-- keyword overlap
-- recent context match
+Retrieval metadata should explain:
 
-Secondary signals:
+- selected ids or topic names
+- selection reason
+- fallback path, if used
+- prompt character cost
+- false-positive or missed-memory labels when evaluator can infer them
 
-- tag match
-- topic match
-- tier
-- hit count
-- recency
-- freshness
+## Task State Contract
+
+`TaskState.status` is owned by the runtime loop, not by hooks. Hooks may observe
+the lifecycle and write trace/report side effects, but they must not decide
+whether a run is completed, stopped, failed, or blocked.
+
+Use `status` for coarse lifecycle outcome and `stop_reason` for the precise
+transition reason. Evaluators, reports, resume logic, and UI summaries should
+read both fields:
+
+- `status`: coarse category such as `running`, `completed`, `stopped`, `failed`
+- `stop_reason`: stable reason such as `final_answer_returned`,
+  `step_limit_reached`, `tool_error`, `approval_denied`, `model_error`
+
+Do not add `checkpoint_id` to `TaskState` in the MVP. If a run needs to refer to
+a future recovery snapshot, introduce a dedicated snapshot schema first.
 
 ## Prompt Order
 
@@ -216,9 +222,8 @@ The prompt must preserve this order:
 
 ```text
 system/prefix
-workspace/tool/checkpoint context
+workspace/tool context
 task state and working memory
-hot memory
 relevant memory topK
 memory index
 history/transcript
@@ -233,6 +238,6 @@ Before considering a refactor phase complete, run the relevant local checks:
 
 - unit tests for changed modules
 - prompt metadata tests when context assembly changes
-- memory retrieval tests when scoring or persistence changes
+- memory selection/retrieval tests when prompt injection or persistence changes
 - runtime smoke test with a fake model
 - CLI smoke test for import and help text

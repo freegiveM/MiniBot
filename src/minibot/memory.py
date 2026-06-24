@@ -4,14 +4,13 @@ import hashlib
 import re
 from pathlib import Path
 
-from .phase import Phase, normalize_phase
 from .workspace import clip, now
 
 
 WORKING_FILE_LIMIT = 8
 RECENT_TOOL_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 20
-DOMAIN_TERMS = ("memory", "retrieval", "delegate", "checkpoint", "phase", "test", "debug", "记忆", "召回", "工具", "恢复", "测评")
+DOMAIN_TERMS = ("memory", "retrieval", "delegate", "test", "debug", "记忆", "召回", "工具", "恢复", "测评")
 
 
 def default_memory_state() -> dict:
@@ -19,8 +18,6 @@ def default_memory_state() -> dict:
         "working": {
             "initial_request_summary": "",
             "task_summary": "",
-            "current_phase": Phase.INTAKE.value,
-            "phase_reason": "",
             "constraints": [],
             "recent_files": [],
             "recent_tools": [],
@@ -31,7 +28,6 @@ def default_memory_state() -> dict:
         "durable_cache": {
             "index_hash": "",
             "loaded_at": "",
-            "hot_memory_ids": [],
         },
     }
 
@@ -114,7 +110,6 @@ def normalize_memory_state(state: dict | None, workspace_root: str | Path | None
     merged_working = {**default["working"], **working}
     merged_working["task_summary"] = clip(str(merged_working.get("task_summary", "")).strip(), 300)
     merged_working["initial_request_summary"] = clip(str(merged_working.get("initial_request_summary", "")).strip(), 300)
-    merged_working["current_phase"] = normalize_phase(merged_working.get("current_phase")).value
     merged_working["constraints"] = [str(item).strip() for item in _ensure_list(merged_working.get("constraints")) if str(item).strip()]
     merged_working["open_questions"] = [str(item).strip() for item in _ensure_list(merged_working.get("open_questions")) if str(item).strip()]
     merged_working["recent_files"] = _dedupe(
@@ -173,7 +168,6 @@ def normalize_memory_state(state: dict | None, workspace_root: str | Path | None
                     "topic": str(note.get("topic", "")).strip(),
                     "source_type": str(note.get("source_type", "")).strip(),
                     "source_ref": str(note.get("source_ref", "")).strip(),
-                    "tier": str(note.get("tier", "warm")).strip() or "warm",
                     "created_at": str(note.get("created_at", "")).strip() or now(),
                     "last_used_at": str(note.get("last_used_at", "")).strip(),
                     "hit_count": int(note.get("hit_count", 0)),
@@ -189,7 +183,6 @@ def normalize_memory_state(state: dict | None, workspace_root: str | Path | None
                     "topic": "",
                     "source_type": "",
                     "source_ref": "",
-                    "tier": "warm",
                     "created_at": now(),
                     "last_used_at": "",
                     "hit_count": 0,
@@ -222,10 +215,6 @@ class LayeredMemory:
         self.working["task_summary"] = clip(str(summary).strip(), 300)
         if not self.working.get("initial_request_summary"):
             self.working["initial_request_summary"] = self.working["task_summary"]
-
-    def set_phase(self, phase: str | Phase, reason: str = "") -> None:
-        self.working["current_phase"] = normalize_phase(phase).value
-        self.working["phase_reason"] = clip(reason, 180)
 
     def remember_file(self, path: str | Path) -> None:
         canonical = self.canonical_path(path)
@@ -290,7 +279,6 @@ class LayeredMemory:
                 "topic": str(topic).strip(),
                 "source_type": str(source_type).strip(),
                 "source_ref": str(source_ref).strip(),
-                "tier": "warm",
                 "created_at": now(),
                 "last_used_at": "",
                 "hit_count": 0,
@@ -306,7 +294,6 @@ class LayeredMemory:
             [
                 str(user_message),
                 working.get("task_summary", ""),
-                working.get("current_phase", ""),
                 " ".join(working.get("recent_files", [])),
                 " ".join(tool.get("name", "") for tool in working.get("recent_tools", [])),
                 " ".join(state.get("file_access", {}).keys()),
@@ -317,7 +304,6 @@ class LayeredMemory:
         return {
             "current_user_request": str(user_message),
             "task_summary": working.get("task_summary", ""),
-            "current_phase": working.get("current_phase", Phase.INTAKE.value),
             "recent_files": list(working.get("recent_files", [])),
             "recent_tools": list(working.get("recent_tools", [])),
             "keywords": keywords,
@@ -333,8 +319,7 @@ class LayeredMemory:
             path_match = int(any(path and path in note.get("text", "") for path in recent_files))
             keyword_overlap = len(query_tokens & note_tokens)
             tag_match = len(query_tokens & {tag.lower() for tag in note.get("tags", [])})
-            tier_bonus = {"hot": 2, "warm": 1, "cold": 0}.get(note.get("tier", "warm"), 0)
-            score = path_match * 5 + keyword_overlap * 3 + tag_match * 1.5 + tier_bonus
+            score = path_match * 5 + keyword_overlap * 3 + tag_match * 1.5
             if score <= 0:
                 continue
             ranked.append((score, note))
@@ -357,8 +342,6 @@ class LayeredMemory:
                 "Task state and working memory:",
                 f"- initial_request_summary: {working.get('initial_request_summary') or '-'}",
                 f"- task_summary: {working.get('task_summary') or '-'}",
-                f"- current_phase: {working.get('current_phase') or '-'}",
-                f"- phase_reason: {working.get('phase_reason') or '-'}",
                 f"- recent_files: {', '.join(working.get('recent_files', [])) or '-'}",
                 f"- recent_tools: {tools}",
                 f"- file_access_count: {len(state.get('file_access', {}))}",
@@ -388,4 +371,3 @@ class LayeredMemory:
         if not index_path.exists():
             return "Memory index:\n- none"
         return "Memory index:\n" + clip(index_path.read_text(encoding="utf-8", errors="replace"), max_chars)
-

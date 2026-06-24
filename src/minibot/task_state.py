@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import uuid4
 
-from .phase import Phase
-
 
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
@@ -31,8 +29,6 @@ class TaskState:
     last_tool: str = ""
     stop_reason: str = ""
     final_answer: str = ""
-    checkpoint_id: str = ""
-    phase: str = Phase.INTAKE.value
 
     @classmethod
     def create(cls, task_id: str, user_request: str, run_id: str = "") -> "TaskState":
@@ -68,7 +64,4 @@ class TaskState:
             "last_tool": self.last_tool,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
-            "checkpoint_id": self.checkpoint_id,
-            "phase": self.phase,
         }
-

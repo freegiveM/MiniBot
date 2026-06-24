@@ -10,7 +10,6 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
-from .phase import Phase, infer_initial_phase, phase_after_stop, phase_after_tool
 from .run_store import RunStore
 from .task_state import (
     STOP_REASON_APPROVAL_DENIED,
@@ -104,7 +103,6 @@ class MiniBot:
             "turn_count": 0,
             "history": [],
             "memory": memorylib.default_memory_state(),
-            "checkpoints": {"current_id": "", "items": {}},
             "runs": {"last_run_id": "", "recent_run_ids": []},
             "memory_maintenance": {
                 "pending_store": ".minibot/memory/pending.jsonl",
@@ -120,7 +118,7 @@ class MiniBot:
         for key, value in default.items():
             self.session.setdefault(key, value)
         self.session["memory"] = memorylib.normalize_memory_state(self.session.get("memory"), self.root)
-        self.session.setdefault("checkpoints", {"current_id": "", "items": {}})
+        self.session.pop("checkpoints", None)
         self.session.setdefault("runs", {"last_run_id": "", "recent_run_ids": []})
         self.session.setdefault("pending_delegates", [])
 
@@ -177,41 +175,20 @@ class MiniBot:
             },
         )
 
-    def create_checkpoint(self, task_state: TaskState, trigger: str) -> dict:
-        checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
-        checkpoint = {
-            "checkpoint_id": checkpoint_id,
-            "created_at": now(),
-            "trigger": trigger,
-            "phase": self.memory.working.get("current_phase", Phase.INTAKE.value),
-            "recent_files": list(self.memory.working.get("recent_files", [])),
-            "runtime_identity": self.current_runtime_identity(),
-        }
-        state = self.session.setdefault("checkpoints", {"current_id": "", "items": {}})
-        state.setdefault("items", {})[checkpoint_id] = checkpoint
-        state["current_id"] = checkpoint_id
-        task_state.checkpoint_id = checkpoint_id
-        self.session["runtime_identity"] = checkpoint["runtime_identity"]
-        self.session_path = self.session_store.save(self.session)
-        return checkpoint
-
     def ask(self, user_message: str) -> str:
         self.memory.set_task_summary(user_message)
-        initial_phase = infer_initial_phase(user_message)
-        self.memory.set_phase(initial_phase, "new user request")
         self.session["memory"] = self.memory.to_dict()
         self.session["turn_count"] = int(self.session.get("turn_count", 0)) + 1
         self.record({"role": "user", "content": str(user_message), "created_at": now()})
 
         task_state = TaskState.create(task_id="task_" + uuid.uuid4().hex[:8], user_request=str(user_message))
-        task_state.phase = self.memory.working.get("current_phase", Phase.INTAKE.value)
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
         self.session["runs"]["last_run_id"] = task_state.run_id
         recent_ids = [item for item in self.session["runs"].get("recent_run_ids", []) if item != task_state.run_id]
         recent_ids.append(task_state.run_id)
         self.session["runs"]["recent_run_ids"] = recent_ids[-10:]
-        self.emit_trace(task_state, "run_started", {"task_id": task_state.task_id, "phase": task_state.phase})
+        self.emit_trace(task_state, "run_started", {"task_id": task_state.task_id})
 
         attempts = 0
         while task_state.tool_steps < self.max_steps and attempts < max(self.max_steps * 3, 4):
@@ -231,14 +208,10 @@ class MiniBot:
                 result = self.run_tool(name, args)
                 metadata = dict(self._last_tool_result_metadata)
                 self.record({"role": "tool", "name": name, "args": args, "content": result, "created_at": now()})
-                new_phase = phase_after_tool(name, args, metadata)
-                self.memory.set_phase(new_phase, f"{name}:{metadata.get('tool_status', '')}")
-                task_state.phase = new_phase.value
                 self.session["memory"] = self.memory.to_dict()
                 self.session_path = self.session_store.save(self.session)
                 self.run_store.write_task_state(task_state)
                 self.emit_trace(task_state, "tool_executed", {"name": name, "args": args, "result": clip(result, 500), **metadata})
-                self.emit_trace(task_state, "checkpoint_created", self.create_checkpoint(task_state, "tool_executed"))
                 continue
 
             if kind == "retry":
@@ -249,11 +222,8 @@ class MiniBot:
             final = str(payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
-            self.memory.set_phase(phase_after_stop(STOP_REASON_FINAL_ANSWER_RETURNED), "final answer returned")
-            task_state.phase = self.memory.working.get("current_phase", Phase.FINALIZE.value)
             self.session["memory"] = self.memory.to_dict()
             self.run_store.write_task_state(task_state)
-            self.emit_trace(task_state, "checkpoint_created", self.create_checkpoint(task_state, "run_finished"))
             self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
             self.run_store.write_report(task_state, self.build_report(task_state))
             return final
@@ -265,12 +235,9 @@ class MiniBot:
         )
         reason = STOP_REASON_RETRY_LIMIT_REACHED if attempts >= max(self.max_steps * 3, 4) else STOP_REASON_STEP_LIMIT_REACHED
         task_state.stop(reason, final_answer=final)
-        self.memory.set_phase(phase_after_stop(reason), reason)
-        task_state.phase = self.memory.working.get("current_phase", Phase.BLOCKED.value)
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.session["memory"] = self.memory.to_dict()
         self.run_store.write_task_state(task_state)
-        self.emit_trace(task_state, "checkpoint_created", self.create_checkpoint(task_state, reason))
         self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
         self.run_store.write_report(task_state, self.build_report(task_state))
         return final
@@ -337,7 +304,6 @@ class MiniBot:
             "session_id": self.session.get("id", ""),
             "prompt_metadata": self.last_prompt_metadata,
             "memory": {
-                "phase": self.memory.working.get("current_phase", ""),
                 "file_access_count": len(self.memory.to_dict().get("file_access", {})),
                 "episodic_note_count": len(self.memory.to_dict().get("episodic_notes", [])),
             },
@@ -359,4 +325,3 @@ class MiniBot:
         if final_match:
             return "final", final_match.group(1).strip()
         return "final", text
-
