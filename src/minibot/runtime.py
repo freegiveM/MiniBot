@@ -10,6 +10,13 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .permission import (
+    ACTION_ALLOW,
+    ACTION_ASK,
+    ACTION_DENY,
+    PermissionPipeline,
+    PermissionRequest,
+)
 from .run_store import RunStore
 from .task_state import (
     STATUS_FAILED,
@@ -82,6 +89,11 @@ class MiniBot:
         self._ensure_session_shape()
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.tools = toolkit.build_tool_registry(self)
+        self.permission_pipeline = PermissionPipeline(
+            self.root,
+            approval_policy=self.approval_policy,
+            read_only=self.read_only,
+        )
         self.prefix = self.build_prefix()
         self.context_manager = ContextManager(self)
         self.current_task_state: TaskState | None = None
@@ -146,6 +158,7 @@ class MiniBot:
             "workspace_fingerprint": self.workspace.fingerprint(),
             "tool_signature": hashlib.sha256(toolkit.tool_signature(self.tools).encode("utf-8")).hexdigest(),
             "read_only": self.read_only,
+            "approval_policy": self.approval_policy,
             "model_provider": self.model_client.__class__.__name__,
         }
 
@@ -312,12 +325,37 @@ class MiniBot:
         self._last_tool_result_metadata = {"tool_status": "unknown", "affected_paths": []}
         try:
             spec = self.tools.spec(name)
-            self.tools.validate_tool_call(name, args, self)
-            if spec.risky and not self.approve(name, args):
-                self._last_tool_result_metadata = {"tool_status": "rejected", "affected_paths": [], "stop_reason": STOP_REASON_APPROVAL_DENIED}
+            decision = self.permission_pipeline.check(
+                PermissionRequest(
+                    tool_name=name,
+                    args=args,
+                    risk_level=spec.risk_level,
+                    workspace_root=self.root,
+                    read_only=self.read_only,
+                )
+            )
+            if decision.action == ACTION_DENY:
+                self._last_tool_result_metadata = {
+                    "tool_status": "rejected",
+                    "affected_paths": [],
+                    "stop_reason": STOP_REASON_APPROVAL_DENIED,
+                    **decision.to_metadata(),
+                }
+                return f"tool denied by permission policy: {decision.reason}"
+            if decision.action == ACTION_ASK and not self.approve(name, args):
+                self._last_tool_result_metadata = {
+                    "tool_status": "rejected",
+                    "affected_paths": [],
+                    "stop_reason": STOP_REASON_APPROVAL_DENIED,
+                    **decision.to_metadata(),
+                }
                 return "tool rejected by approval policy"
+            if decision.action not in {ACTION_ALLOW, ACTION_ASK}:
+                raise ValueError(f"unknown permission action: {decision.action}")
+
+            self.tools.validate_tool_call(name, args, self)
             observation = self.tools.dispatch(name, args, self, validate=False)
-            metadata = {"tool_status": observation.status, **observation.metadata}
+            metadata = {"tool_status": observation.status, **observation.metadata, **decision.to_metadata()}
             if observation.error:
                 metadata["error"] = observation.error
             if observation.status == toolkit.OBSERVATION_ERROR:
