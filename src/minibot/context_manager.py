@@ -5,7 +5,6 @@ SECTION_ORDER = (
     "prefix",
     "workspace",
     "working_memory",
-    "hot_memory",
     "relevant_memory",
     "memory_index",
     "history",
@@ -23,7 +22,6 @@ class ContextManager:
             "prefix": str(self.agent.prefix),
             "workspace": self.agent.workspace.text(),
             "working_memory": self.agent.memory.render_memory_text(),
-            "hot_memory": "Hot memory:\n- none",
             "relevant_memory": relevant_text,
             "memory_index": self.agent.memory.render_memory_index(),
             "history": self._history_text(),
@@ -35,7 +33,6 @@ class ContextManager:
             "sections": {name: {"chars": len(sections[name])} for name in SECTION_ORDER},
             "prompt_chars": len(prompt),
             "relevant_memory": relevant_meta,
-            "current_phase": self.agent.memory.working.get("current_phase", ""),
             "current_request": {
                 "text": str(user_message),
                 "chars": len(str(user_message)),
@@ -56,4 +53,3 @@ class ContextManager:
             else:
                 lines.append(f"[{role}] {item.get('content', '')}")
         return "\n".join(lines)
-
