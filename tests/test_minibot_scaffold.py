@@ -69,6 +69,38 @@ class MiniBotScaffoldTests(unittest.TestCase):
             self.assertTrue(prompt.endswith("Current user request:\nkeep this exact request"))
             self.assertLess(prompt.index("Relevant memory:"), prompt.index("Current user request:"))
 
+    def test_context_renders_truncated_tool_observation_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root, [])
+            agent.session["history"] = [
+                {
+                    "role": "tool",
+                    "name": "read_file",
+                    "args": {"path": "README.md", "start": 1, "end": 20},
+                    "content": "preview only\n...[truncated 8000 chars]",
+                    "metadata": {
+                        "artifact_ref": "runs/run_1/trace.jsonl",
+                        "content_chars": 9230,
+                        "ignored_internal": "do not render",
+                        "tool_status": "succeeded",
+                        "truncated": True,
+                    },
+                }
+            ]
+
+            prompt, _ = agent.context_manager.build("continue")
+
+            self.assertIn('[tool:read_file] args={"end": 20, "path": "README.md", "start": 1}', prompt)
+            self.assertIn('"artifact_ref": "runs/run_1/trace.jsonl"', prompt)
+            self.assertIn('"content_chars": 9230', prompt)
+            self.assertIn('"truncated": true', prompt)
+            self.assertIn("Observation preview:", prompt)
+            self.assertIn("Re-run read_file/search", prompt)
+            self.assertIn("artifact_ref is for audit, not resume context", prompt)
+            self.assertNotIn("ignored_internal", prompt)
+
     def test_resume_uses_session_without_previous_run_artifacts(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

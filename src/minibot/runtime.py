@@ -12,8 +12,9 @@ from . import memory as memorylib
 from .context_manager import ContextManager
 from .run_store import RunStore
 from .task_state import (
+    STATUS_FAILED,
     STOP_REASON_APPROVAL_DENIED,
-    STOP_REASON_FINAL_ANSWER_RETURNED,
+    STOP_REASON_MODEL_ERROR,
     STOP_REASON_RETRY_LIMIT_REACHED,
     STOP_REASON_STEP_LIMIT_REACHED,
     STOP_REASON_TOOL_ERROR,
@@ -25,6 +26,8 @@ from .workspace import clip, now
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "PWD", "TMP", "TEMP", "USER")
 RISKY_TOOLS = {"run_shell", "write_file", "patch_file"}
+RECENT_RUN_LIMIT = 10
+SESSION_TOOL_OBSERVATION_LIMIT = 1200
 
 
 class SessionStore:
@@ -175,72 +178,133 @@ class MiniBot:
             },
         )
 
-    def ask(self, user_message: str) -> str:
+    def _start_task(self, user_message: str) -> TaskState:
         self.memory.set_task_summary(user_message)
         self.session["memory"] = self.memory.to_dict()
+        self.session["runtime_identity"] = self.current_runtime_identity()
         self.session["turn_count"] = int(self.session.get("turn_count", 0)) + 1
         self.record({"role": "user", "content": str(user_message), "created_at": now()})
 
         task_state = TaskState.create(task_id="task_" + uuid.uuid4().hex[:8], user_request=str(user_message))
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
-        self.session["runs"]["last_run_id"] = task_state.run_id
-        recent_ids = [item for item in self.session["runs"].get("recent_run_ids", []) if item != task_state.run_id]
-        recent_ids.append(task_state.run_id)
-        self.session["runs"]["recent_run_ids"] = recent_ids[-10:]
+        self._remember_run(task_state.run_id)
         self.emit_trace(task_state, "run_started", {"task_id": task_state.task_id})
+        return task_state
+
+    def _remember_run(self, run_id: str) -> None:
+        runs = self.session.setdefault("runs", {"last_run_id": "", "recent_run_ids": []})
+        runs["last_run_id"] = run_id
+        recent_ids = [item for item in runs.get("recent_run_ids", []) if item != run_id]
+        recent_ids.append(run_id)
+        runs["recent_run_ids"] = recent_ids[-RECENT_RUN_LIMIT:]
+        self.session_path = self.session_store.save(self.session)
+
+    def _attempt_limit(self) -> int:
+        return max(self.max_steps * 3, 4)
+
+    def _record_assistant_decision(self, raw: str, kind: str, payload: object) -> None:
+        item = {
+            "role": "assistant",
+            "content": str(raw or ""),
+            "decision": kind,
+            "created_at": now(),
+        }
+        if kind == "retry":
+            item["parse_error"] = str(payload)
+        self.record(item)
+
+    def _record_tool_observation(self, task_state: TaskState, name: str, args: dict, result: str, metadata: dict) -> None:
+        result_text = str(result)
+        preview = clip(result_text, SESSION_TOOL_OBSERVATION_LIMIT)
+        self.session["memory"] = self.memory.to_dict()
+        self.record(
+            {
+                "role": "tool",
+                "name": name,
+                "args": args,
+                "content": preview,
+                "metadata": {
+                    "artifact_ref": f"runs/{task_state.run_id}/trace.jsonl",
+                    "content_chars": len(result_text),
+                    "truncated": preview != result_text,
+                    **metadata,
+                },
+                "created_at": now(),
+            }
+        )
+
+    def _finish_run_success(self, task_state: TaskState, final: str) -> str:
+        self.session["memory"] = self.memory.to_dict()
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        task_state.finish_success(final)
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
+        self.run_store.write_report(task_state, self.build_report(task_state))
+        return final
+
+    def _stop_run(self, task_state: TaskState, reason: str, final: str, status: str | None = None) -> str:
+        if status is None:
+            task_state.stop(reason, final_answer=final)
+        else:
+            task_state.stop(reason, status=status, final_answer=final)
+        self.session["memory"] = self.memory.to_dict()
+        self.record({"role": "assistant", "content": final, "created_at": now()})
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
+        self.run_store.write_report(task_state, self.build_report(task_state))
+        return final
+
+    def ask(self, user_message: str) -> str:
+        task_state = self._start_task(user_message)
 
         attempts = 0
-        while task_state.tool_steps < self.max_steps and attempts < max(self.max_steps * 3, 4):
+        while task_state.tool_steps < self.max_steps and attempts < self._attempt_limit():
             attempts += 1
             task_state.record_attempt()
             prompt, prompt_metadata = self.context_manager.build(user_message)
             self.last_prompt_metadata = prompt_metadata
             self.emit_trace(task_state, "prompt_built", {"prompt_metadata": prompt_metadata})
-            raw = self.model_client.complete(prompt, self.max_new_tokens)
+            try:
+                raw = self.model_client.complete(prompt, self.max_new_tokens)
+            except Exception as exc:
+                final = f"Stopped after model error: {exc}"
+                self.emit_trace(task_state, "model_error", {"error": str(exc)})
+                return self._stop_run(task_state, STOP_REASON_MODEL_ERROR, final, status=STATUS_FAILED)
             kind, payload = self.parse(raw)
             self.emit_trace(task_state, "model_parsed", {"kind": kind})
 
             if kind == "tool":
+                self._record_assistant_decision(raw, kind, payload)
                 name = str(payload.get("name", ""))
                 args = dict(payload.get("args", {}) or {})
                 task_state.record_tool(name)
                 result = self.run_tool(name, args)
                 metadata = dict(self._last_tool_result_metadata)
-                self.record({"role": "tool", "name": name, "args": args, "content": result, "created_at": now()})
-                self.session["memory"] = self.memory.to_dict()
-                self.session_path = self.session_store.save(self.session)
+                self._record_tool_observation(task_state, name, args, result, metadata)
                 self.run_store.write_task_state(task_state)
-                self.emit_trace(task_state, "tool_executed", {"name": name, "args": args, "result": clip(result, 500), **metadata})
+                self.emit_trace(
+                    task_state,
+                    "tool_executed",
+                    {"name": name, "args": args, "result": str(result), "result_chars": len(str(result)), **metadata},
+                )
                 continue
 
             if kind == "retry":
-                self.record({"role": "assistant", "content": str(payload), "created_at": now()})
+                self._record_assistant_decision(raw, kind, payload)
                 self.run_store.write_task_state(task_state)
                 continue
 
             final = str(payload or raw).strip()
-            self.record({"role": "assistant", "content": final, "created_at": now()})
-            task_state.finish_success(final)
-            self.session["memory"] = self.memory.to_dict()
-            self.run_store.write_task_state(task_state)
-            self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
-            self.run_store.write_report(task_state, self.build_report(task_state))
-            return final
+            return self._finish_run_success(task_state, final)
 
         final = (
             "Stopped after too many malformed model responses."
-            if attempts >= max(self.max_steps * 3, 4)
+            if attempts >= self._attempt_limit()
             else "Stopped after reaching the step limit without a final answer."
         )
-        reason = STOP_REASON_RETRY_LIMIT_REACHED if attempts >= max(self.max_steps * 3, 4) else STOP_REASON_STEP_LIMIT_REACHED
-        task_state.stop(reason, final_answer=final)
-        self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.session["memory"] = self.memory.to_dict()
-        self.run_store.write_task_state(task_state)
-        self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
-        self.run_store.write_report(task_state, self.build_report(task_state))
-        return final
+        reason = STOP_REASON_RETRY_LIMIT_REACHED if attempts >= self._attempt_limit() else STOP_REASON_STEP_LIMIT_REACHED
+        return self._stop_run(task_state, reason, final)
 
     def run_tool(self, name: str, args: dict) -> str:
         self._last_tool_result_metadata = {"tool_status": "unknown", "affected_paths": []}
