@@ -25,7 +25,6 @@ from .workspace import clip, now
 
 
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "PATH", "PWD", "TMP", "TEMP", "USER")
-RISKY_TOOLS = {"run_shell", "write_file", "patch_file"}
 RECENT_RUN_LIMIT = 10
 SESSION_TOOL_OBSERVATION_LIMIT = 1200
 
@@ -128,7 +127,7 @@ class MiniBot:
     def build_prefix(self) -> str:
         tool_lines = []
         for name, spec in sorted(self.tools.items()):
-            tool_lines.append(f"- {name}: {spec['description']} args={spec['schema']} risky={spec['risky']}")
+            tool_lines.append(f"- {name}: {spec.description} args={spec.schema} risky={spec.risky}")
         return "\n".join(
             [
                 "You are MiniBot, a local coding agent.",
@@ -276,18 +275,21 @@ class MiniBot:
 
             if kind == "tool":
                 self._record_assistant_decision(raw, kind, payload)
-                name = str(payload.get("name", ""))
-                args = dict(payload.get("args", {}) or {})
-                task_state.record_tool(name)
-                result = self.run_tool(name, args)
-                metadata = dict(self._last_tool_result_metadata)
-                self._record_tool_observation(task_state, name, args, result, metadata)
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {"name": name, "args": args, "result": str(result), "result_chars": len(str(result)), **metadata},
-                )
+                for call in payload:
+                    if task_state.tool_steps >= self.max_steps:
+                        break
+                    name = call.name
+                    args = dict(call.args)
+                    task_state.record_tool(name)
+                    result = self.run_tool(name, args)
+                    metadata = dict(self._last_tool_result_metadata)
+                    self._record_tool_observation(task_state, name, args, result, metadata)
+                    self.run_store.write_task_state(task_state)
+                    self.emit_trace(
+                        task_state,
+                        "tool_executed",
+                        {"name": name, "args": args, "result": str(result), "result_chars": len(str(result)), **metadata},
+                    )
                 continue
 
             if kind == "retry":
@@ -309,18 +311,20 @@ class MiniBot:
     def run_tool(self, name: str, args: dict) -> str:
         self._last_tool_result_metadata = {"tool_status": "unknown", "affected_paths": []}
         try:
-            toolkit.validate_tool(self, name, args)
-            if name in RISKY_TOOLS and not self.approve(name, args):
+            spec = self.tools.spec(name)
+            self.tools.validate_tool_call(name, args, self)
+            if spec.risky and not self.approve(name, args):
                 self._last_tool_result_metadata = {"tool_status": "rejected", "affected_paths": [], "stop_reason": STOP_REASON_APPROVAL_DENIED}
                 return "tool rejected by approval policy"
-            result = self.tools[name]["run"](args)
-            status = "succeeded"
-            if name == "run_shell" and "exit_code: 0" not in str(result).splitlines()[0]:
-                status = "error"
-            affected = [str(args.get("path", "")).strip()] if args.get("path") else []
-            self._last_tool_result_metadata = {"tool_status": status, "affected_paths": affected}
-            self.update_memory_after_tool(name, args, result, status)
-            return result
+            observation = self.tools.dispatch(name, args, self, validate=False)
+            metadata = {"tool_status": observation.status, **observation.metadata}
+            if observation.error:
+                metadata["error"] = observation.error
+            if observation.status == toolkit.OBSERVATION_ERROR:
+                metadata.setdefault("stop_reason", STOP_REASON_TOOL_ERROR)
+            self._last_tool_result_metadata = metadata
+            self.update_memory_after_tool(name, args, observation.content, observation.status)
+            return observation.content
         except Exception as exc:
             self._last_tool_result_metadata = {"tool_status": "error", "affected_paths": [], "stop_reason": STOP_REASON_TOOL_ERROR}
             return f"tool error: {exc}"
@@ -380,10 +384,8 @@ class MiniBot:
         if tool_match:
             try:
                 payload = json.loads(tool_match.group(1).strip())
-                if not isinstance(payload, dict):
-                    return "retry", "tool payload must be an object"
-                return "tool", payload
-            except json.JSONDecodeError as exc:
+                return "tool", toolkit.normalize_tool_calls(payload)
+            except (json.JSONDecodeError, ValueError) as exc:
                 return "retry", f"invalid tool JSON: {exc}"
         final_match = re.search(r"<final>(.*?)</final>", text, re.S)
         if final_match:

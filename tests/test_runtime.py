@@ -106,6 +106,27 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(marker, tool_events[0]["result"])
             self.assertGreater(tool_events[0]["result_chars"], SESSION_TOOL_OBSERVATION_LIMIT)
 
+    def test_runtime_executes_tool_call_batch_in_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "a.py").write_text("A = 1\n", encoding="utf-8")
+            (root / "b.py").write_text("B = 2\n", encoding="utf-8")
+            outputs = [
+                '<tool>[{"name":"read_file","args":{"path":"a.py"}},{"name":"read_file","args":{"path":"b.py"}}]</tool>',
+                "<final>Done.</final>",
+            ]
+            agent = self.build_agent(root, outputs)
+
+            self.assertEqual(agent.ask("read both"), "Done.")
+
+            run_id = agent.session["runs"]["last_run_id"]
+            state = self.load_task_state(root, run_id)
+            tool_events = [event for event in self.load_trace_events(root, run_id) if event["event"] == "tool_executed"]
+            saved = agent.session_store.load(agent.session["id"])
+            self.assertEqual(state["tool_steps"], 2)
+            self.assertEqual([event["args"]["path"] for event in tool_events], ["a.py", "b.py"])
+            self.assertEqual([item["role"] for item in saved["history"]], ["user", "assistant", "tool", "tool", "assistant"])
+
     def test_runtime_stops_when_step_budget_is_reached(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
