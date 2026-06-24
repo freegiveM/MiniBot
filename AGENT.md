@@ -221,16 +221,20 @@ a future recovery snapshot, introduce a dedicated snapshot schema first.
 The prompt must preserve this order:
 
 ```text
-system/prefix
-workspace/tool context
-task state and working memory
-relevant memory topK
-memory index
-history/transcript
-current user request
+identity
+workspace
+tools
+task_state
+working_memory
+relevant_memory
+memory_index
+history
+current_request
 ```
 
-The current user request is never trimmed.
+Each section is rendered independently by `ContextManager` and has prompt
+metadata for source, character count, budget, truncation state, and truncation
+reason. The current user request is never trimmed.
 
 ## Verification Gates
 
