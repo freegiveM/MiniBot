@@ -10,6 +10,14 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .hooks import (
+    EVENT_POST_TOOL_USE,
+    EVENT_PRE_TOOL_USE,
+    EVENT_STOP,
+    EVENT_USER_PROMPT_SUBMIT,
+    HookManager,
+    build_default_hook_manager,
+)
 from .permission import (
     ACTION_ALLOW,
     ACTION_ASK,
@@ -73,6 +81,7 @@ class MiniBot:
         max_depth: int = 1,
         read_only: bool = False,
         shell_env_allowlist: tuple[str, ...] | None = None,
+        hook_manager: HookManager | None = None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -90,6 +99,7 @@ class MiniBot:
         self._ensure_session_shape()
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.todo_state = TodoState.from_dict(self.session.get("todo_state", {}))
+        self.hooks = hook_manager or build_default_hook_manager()
         self.tools = toolkit.build_tool_registry(self)
         self.permission_pipeline = PermissionPipeline(
             self.root,
@@ -102,6 +112,8 @@ class MiniBot:
         self.current_run_dir: Path | None = None
         self.last_prompt_metadata: dict = {}
         self._last_tool_result_metadata: dict = {}
+        self._current_tool_events: list[dict] = []
+        self.hook_results: list[dict] = []
         self.session_path = self.session_store.save(self.session)
 
     @classmethod
@@ -199,6 +211,28 @@ class MiniBot:
             },
         )
 
+    def _emit_hooks(self, event: str, payload: dict | None = None, task_state: TaskState | None = None):
+        task_state = task_state or self.current_task_state
+        hook_payload = {
+            "agent": self,
+            "session_id": self.session.get("id", ""),
+            **(payload or {}),
+        }
+        if task_state is not None:
+            hook_payload.setdefault("task_state", task_state.to_dict())
+        result = self.hooks.emit(event, hook_payload)
+        result_payload = result.to_dict()
+        self.hook_results.append(result_payload)
+        if task_state is not None:
+            self.emit_trace(task_state, "hook_emitted", {"hook_event": event, "hook_result": result_payload})
+        return result
+
+    @staticmethod
+    def _hook_error_metadata(result) -> dict:
+        if not result.errors:
+            return {}
+        return {"hook_errors": list(result.errors)}
+
     def _start_task(self, user_message: str) -> TaskState:
         self.memory.set_task_summary(user_message)
         self.session["memory"] = self.memory.to_dict()
@@ -208,9 +242,12 @@ class MiniBot:
 
         task_state = TaskState.create(task_id="task_" + uuid.uuid4().hex[:8], user_request=str(user_message))
         self.current_task_state = task_state
+        self._current_tool_events = []
+        self.hook_results = []
         self.current_run_dir = self.run_store.start_run(task_state)
         self._remember_run(task_state.run_id)
         self.emit_trace(task_state, "run_started", {"task_id": task_state.task_id})
+        self._emit_hooks(EVENT_USER_PROMPT_SUBMIT, {"user_message": str(user_message)}, task_state)
         return task_state
 
     def _remember_run(self, run_id: str) -> None:
@@ -259,6 +296,13 @@ class MiniBot:
         self.session["memory"] = self.memory.to_dict()
         self.record({"role": "assistant", "content": final, "created_at": now()})
         task_state.finish_success(final)
+        self._emit_hooks(
+            EVENT_STOP,
+            {"final_answer": final, "tool_events": list(self._current_tool_events)},
+            task_state,
+        )
+        self.session["memory"] = self.memory.to_dict()
+        self.session_path = self.session_store.save(self.session)
         self.run_store.write_task_state(task_state)
         self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
         self.run_store.write_report(task_state, self.build_report(task_state))
@@ -271,6 +315,13 @@ class MiniBot:
             task_state.stop(reason, status=status, final_answer=final)
         self.session["memory"] = self.memory.to_dict()
         self.record({"role": "assistant", "content": final, "created_at": now()})
+        self._emit_hooks(
+            EVENT_STOP,
+            {"final_answer": final, "tool_events": list(self._current_tool_events)},
+            task_state,
+        )
+        self.session["memory"] = self.memory.to_dict()
+        self.session_path = self.session_store.save(self.session)
         self.run_store.write_task_state(task_state)
         self.emit_trace(task_state, "run_finished", {"status": task_state.status, "stop_reason": task_state.stop_reason})
         self.run_store.write_report(task_state, self.build_report(task_state))
@@ -309,6 +360,14 @@ class MiniBot:
                     metadata = dict(self._last_tool_result_metadata)
                     self._record_tool_observation(task_state, name, args, result, metadata)
                     self.run_store.write_task_state(task_state)
+                    tool_event = {
+                        "name": name,
+                        "args": args,
+                        "status": metadata.get("tool_status", ""),
+                        "result_chars": len(str(result)),
+                        "result_preview": clip(result, 800),
+                    }
+                    self._current_tool_events.append(tool_event)
                     self.emit_trace(
                         task_state,
                         "tool_executed",
@@ -336,6 +395,11 @@ class MiniBot:
         self._last_tool_result_metadata = {"tool_status": "unknown", "affected_paths": []}
         try:
             spec = self.tools.spec(name)
+            pre_hook = self._emit_hooks(
+                EVENT_PRE_TOOL_USE,
+                {"tool_name": name, "args": dict(args), "risk_level": spec.risk_level},
+            )
+            pre_hook_metadata = self._hook_error_metadata(pre_hook)
             decision = self.permission_pipeline.check(
                 PermissionRequest(
                     tool_name=name,
@@ -351,6 +415,7 @@ class MiniBot:
                     "affected_paths": [],
                     "stop_reason": STOP_REASON_APPROVAL_DENIED,
                     **decision.to_metadata(),
+                    **pre_hook_metadata,
                 }
                 return f"tool denied by permission policy: {decision.reason}"
             if decision.action == ACTION_ASK and not self.approve(name, args):
@@ -359,6 +424,7 @@ class MiniBot:
                     "affected_paths": [],
                     "stop_reason": STOP_REASON_APPROVAL_DENIED,
                     **decision.to_metadata(),
+                    **pre_hook_metadata,
                 }
                 return "tool rejected by approval policy"
             if decision.action not in {ACTION_ALLOW, ACTION_ASK}:
@@ -367,10 +433,22 @@ class MiniBot:
             self.tools.validate_tool_call(name, args, self)
             observation = self.tools.dispatch(name, args, self, validate=False)
             metadata = {"tool_status": observation.status, **observation.metadata, **decision.to_metadata()}
+            metadata.update(pre_hook_metadata)
             if observation.error:
                 metadata["error"] = observation.error
             if observation.status == toolkit.OBSERVATION_ERROR:
                 metadata.setdefault("stop_reason", STOP_REASON_TOOL_ERROR)
+            post_hook = self._emit_hooks(
+                EVENT_POST_TOOL_USE,
+                {
+                    "tool_name": name,
+                    "args": dict(args),
+                    "result": observation.content,
+                    "observation_status": observation.status,
+                    "observation_metadata": dict(observation.metadata),
+                },
+            )
+            metadata.update(post_hook.metadata_updates())
             self._last_tool_result_metadata = metadata
             self.update_memory_after_tool(name, args, observation.content, observation.status)
             return observation.content
@@ -421,10 +499,21 @@ class MiniBot:
             "todo_state": self.todo_state.to_dict(),
             "session_id": self.session.get("id", ""),
             "prompt_metadata": self.last_prompt_metadata,
+            "hooks": self._hook_report(),
             "memory": {
                 "file_access_count": len(self.memory.to_dict().get("file_access", {})),
                 "episodic_note_count": len(self.memory.to_dict().get("episodic_notes", [])),
             },
+        }
+
+    def _hook_report(self) -> dict:
+        errors = []
+        for result in self.hook_results:
+            errors.extend(result.get("errors", []))
+        return {
+            "emissions": list(self.hook_results),
+            "error_count": len(errors),
+            "errors": errors,
         }
 
     @staticmethod
