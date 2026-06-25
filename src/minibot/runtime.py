@@ -25,11 +25,17 @@ from .permission import (
     PermissionPipeline,
     PermissionRequest,
 )
+from .recovery import (
+    ACTION_RETRY_MODEL,
+    RecoveryEvent,
+    RecoveryPolicy,
+)
 from .run_store import RunStore
 from .task_state import (
     STATUS_FAILED,
     STOP_REASON_APPROVAL_DENIED,
     STOP_REASON_MODEL_ERROR,
+    STOP_REASON_PROMPT_TOO_LONG,
     STOP_REASON_RETRY_LIMIT_REACHED,
     STOP_REASON_STEP_LIMIT_REACHED,
     STOP_REASON_TOOL_ERROR,
@@ -82,6 +88,7 @@ class MiniBot:
         read_only: bool = False,
         shell_env_allowlist: tuple[str, ...] | None = None,
         hook_manager: HookManager | None = None,
+        recovery_policy: RecoveryPolicy | None = None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -100,6 +107,7 @@ class MiniBot:
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.todo_state = TodoState.from_dict(self.session.get("todo_state", {}))
         self.hooks = hook_manager or build_default_hook_manager()
+        self.recovery_policy = recovery_policy or RecoveryPolicy()
         self.tools = toolkit.build_tool_registry(self)
         self.permission_pipeline = PermissionPipeline(
             self.root,
@@ -114,6 +122,8 @@ class MiniBot:
         self._last_tool_result_metadata: dict = {}
         self._current_tool_events: list[dict] = []
         self.hook_results: list[dict] = []
+        self.recovery_events: list[dict] = []
+        self._model_error_retries = 0
         self.session_path = self.session_store.save(self.session)
 
     @classmethod
@@ -141,6 +151,10 @@ class MiniBot:
             },
             "pending_delegates": [],
             "delegate_artifacts": [],
+            "recovery": {
+                "workspace_drift_detected": False,
+                "last_event": {},
+            },
         }
 
     def _ensure_session_shape(self) -> None:
@@ -153,6 +167,7 @@ class MiniBot:
         self.session.setdefault("runs", {"last_run_id": "", "recent_run_ids": []})
         self.session.setdefault("pending_delegates", [])
         self.session.setdefault("delegate_artifacts", [])
+        self.session.setdefault("recovery", {"workspace_drift_detected": False, "last_event": {}})
 
     def build_prefix(self) -> str:
         tool_lines = []
@@ -236,9 +251,11 @@ class MiniBot:
         return {"hook_errors": list(result.errors)}
 
     def _start_task(self, user_message: str) -> TaskState:
+        previous_identity = dict(self.session.get("runtime_identity") or {})
+        current_identity = self.current_runtime_identity()
         self.memory.set_task_summary(user_message)
         self.session["memory"] = self.memory.to_dict()
-        self.session["runtime_identity"] = self.current_runtime_identity()
+        self.session["runtime_identity"] = current_identity
         self.session["turn_count"] = int(self.session.get("turn_count", 0)) + 1
         self.record({"role": "user", "content": str(user_message), "created_at": now()})
 
@@ -246,11 +263,27 @@ class MiniBot:
         self.current_task_state = task_state
         self._current_tool_events = []
         self.hook_results = []
+        self.recovery_events = []
+        self._model_error_retries = 0
         self.current_run_dir = self.run_store.start_run(task_state)
         self._remember_run(task_state.run_id)
         self.emit_trace(task_state, "run_started", {"task_id": task_state.task_id})
+        drift = self.recovery_policy.workspace_drift(previous_identity, current_identity)
+        if drift is not None:
+            self.session.setdefault("recovery", {})["workspace_drift_detected"] = True
+            self._record_recovery(drift, task_state)
         self._emit_hooks(EVENT_USER_PROMPT_SUBMIT, {"user_message": str(user_message)}, task_state)
         return task_state
+
+    def _record_recovery(self, event: RecoveryEvent, task_state: TaskState | None = None) -> dict:
+        payload = event.to_dict()
+        self.recovery_events.append(payload)
+        recovery_state = self.session.setdefault("recovery", {})
+        recovery_state["last_event"] = payload
+        self.session["updated_at"] = now()
+        if task_state is not None:
+            self.emit_trace(task_state, "recovery_triggered", {"recovery": payload})
+        return payload
 
     def _remember_run(self, run_id: str) -> None:
         runs = self.session.setdefault("runs", {"last_run_id": "", "recent_run_ids": []})
@@ -341,11 +374,28 @@ class MiniBot:
             self.emit_trace(task_state, "prompt_built", {"prompt_metadata": prompt_metadata})
             if prompt_metadata.get("compact_summary"):
                 self.emit_trace(task_state, "context_compacted", {"compact_summary": prompt_metadata["compact_summary"]})
+                self._record_recovery(self.recovery_policy.prompt_compacted(prompt_metadata), task_state)
+            if prompt_metadata.get("over_total_budget"):
+                if self.recovery_policy.should_stop_for_current_request(prompt_metadata):
+                    event = self.recovery_policy.current_request_too_long(prompt_metadata)
+                else:
+                    event = self.recovery_policy.prompt_still_too_long(prompt_metadata)
+                self._record_recovery(event, task_state)
+                return self._stop_run(task_state, STOP_REASON_PROMPT_TOO_LONG, event.message)
             try:
                 raw = self.model_client.complete(prompt, self.max_new_tokens)
             except Exception as exc:
+                self._model_error_retries += 1
+                event = self.recovery_policy.model_error(exc, self._model_error_retries)
+                self._record_recovery(event, task_state)
+                self.emit_trace(
+                    task_state,
+                    "model_error",
+                    {"error": str(exc), "recoverable": event.recoverable, "retry_count": self._model_error_retries},
+                )
+                if event.action == ACTION_RETRY_MODEL and attempts < self._attempt_limit():
+                    continue
                 final = f"Stopped after model error: {exc}"
-                self.emit_trace(task_state, "model_error", {"error": str(exc)})
                 return self._stop_run(task_state, STOP_REASON_MODEL_ERROR, final, status=STATUS_FAILED)
             kind, payload = self.parse(raw)
             self.emit_trace(task_state, "model_parsed", {"kind": kind})
@@ -393,10 +443,56 @@ class MiniBot:
         reason = STOP_REASON_RETRY_LIMIT_REACHED if attempts >= self._attempt_limit() else STOP_REASON_STEP_LIMIT_REACHED
         return self._stop_run(task_state, reason, final)
 
+    @staticmethod
+    def _affected_paths(args: dict) -> list[str]:
+        path = args.get("path", "")
+        return [path] if isinstance(path, str) and path.strip() else []
+
+    def _recover_tool_rejection(
+        self,
+        name: str,
+        args: dict,
+        event: RecoveryEvent,
+        metadata: dict | None = None,
+    ) -> str:
+        payload = self._record_recovery(event, self.current_task_state)
+        self._last_tool_result_metadata = {
+            "tool_status": "rejected",
+            "affected_paths": self._affected_paths(args),
+            "recovery_kind": event.kind,
+            "recovery_action": event.action,
+            "recoverable": event.recoverable,
+            **(metadata or {}),
+        }
+        if self.current_task_state is not None:
+            self.emit_trace(
+                self.current_task_state,
+                "tool_rejected",
+                {"name": name, "args": dict(args), "recovery": payload, **self._last_tool_result_metadata},
+            )
+        return event.observation()
+
+    def _stale_write_target(self, name: str, args: dict) -> str:
+        if name not in {"write_file", "patch_file"}:
+            return ""
+        path = str(args.get("path", "")).strip()
+        if not path:
+            return ""
+        canonical = self.memory.canonical_path(path)
+        item = self.memory.to_dict().get("file_access", {}).get(canonical, {})
+        if isinstance(item, dict) and item.get("status") == "stale":
+            return canonical
+        return ""
+
     def run_tool(self, name: str, args: dict) -> str:
         self._last_tool_result_metadata = {"tool_status": "unknown", "affected_paths": []}
         try:
             spec = self.tools.spec(name)
+        except Exception as exc:
+            event = self.recovery_policy.tool_schema_error(name, args, exc)
+            return self._recover_tool_rejection(name, args, event, {"error": str(exc)})
+
+        try:
             pre_hook = self._emit_hooks(
                 EVENT_PRE_TOOL_USE,
                 {"tool_name": name, "args": dict(args), "risk_level": spec.risk_level},
@@ -412,27 +508,39 @@ class MiniBot:
                 )
             )
             if decision.action == ACTION_DENY:
-                self._last_tool_result_metadata = {
-                    "tool_status": "rejected",
-                    "affected_paths": [],
-                    "stop_reason": STOP_REASON_APPROVAL_DENIED,
-                    **decision.to_metadata(),
-                    **pre_hook_metadata,
-                }
-                return f"tool denied by permission policy: {decision.reason}"
+                event = self.recovery_policy.permission_denied(name, args, decision.reason)
+                return self._recover_tool_rejection(
+                    name,
+                    args,
+                    event,
+                    {"stop_reason": STOP_REASON_APPROVAL_DENIED, **decision.to_metadata(), **pre_hook_metadata},
+                )
             if decision.action == ACTION_ASK and not self.approve(name, args):
-                self._last_tool_result_metadata = {
-                    "tool_status": "rejected",
-                    "affected_paths": [],
-                    "stop_reason": STOP_REASON_APPROVAL_DENIED,
-                    **decision.to_metadata(),
-                    **pre_hook_metadata,
-                }
-                return "tool rejected by approval policy"
+                event = self.recovery_policy.permission_denied(name, args, decision.reason or "approval_rejected")
+                return self._recover_tool_rejection(
+                    name,
+                    args,
+                    event,
+                    {"stop_reason": STOP_REASON_APPROVAL_DENIED, **decision.to_metadata(), **pre_hook_metadata},
+                )
             if decision.action not in {ACTION_ALLOW, ACTION_ASK}:
                 raise ValueError(f"unknown permission action: {decision.action}")
 
-            self.tools.validate_tool_call(name, args, self)
+            stale_path = self._stale_write_target(name, args)
+            if stale_path:
+                event = self.recovery_policy.stale_file_state(name, stale_path)
+                return self._recover_tool_rejection(name, args, event, {**decision.to_metadata(), **pre_hook_metadata})
+
+            try:
+                self.tools.validate_tool_call(name, args, self)
+            except Exception as exc:
+                event = self.recovery_policy.tool_schema_error(name, args, exc)
+                return self._recover_tool_rejection(
+                    name,
+                    args,
+                    event,
+                    {"error": str(exc), **decision.to_metadata(), **pre_hook_metadata},
+                )
             observation = self.tools.dispatch(name, args, self, validate=False)
             metadata = {"tool_status": observation.status, **observation.metadata, **decision.to_metadata()}
             metadata.update(pre_hook_metadata)
@@ -503,6 +611,11 @@ class MiniBot:
             "prompt_metadata": self.last_prompt_metadata,
             "hooks": self._hook_report(),
             "delegate_artifacts": list(self.session.get("delegate_artifacts", [])),
+            "recovery": {
+                "events": list(self.recovery_events),
+                "event_count": len(self.recovery_events),
+                "workspace_drift_detected": bool(self.session.get("recovery", {}).get("workspace_drift_detected")),
+            },
             "memory": {
                 "file_access_count": len(self.memory.to_dict().get("file_access", {})),
                 "episodic_note_count": len(self.memory.to_dict().get("episodic_notes", [])),

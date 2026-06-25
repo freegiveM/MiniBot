@@ -20,8 +20,6 @@ COMPACTABLE_SECTION_ORDER = (
     "history",
     "relevant_memory",
     "memory_index",
-    "workspace",
-    "working_memory",
 )
 TOOL_METADATA_PROMPT_FIELDS = (
     "tool_status",
