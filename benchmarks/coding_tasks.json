@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "description": "Fixed regression tasks for MiniBot.",
+  "tasks": [
+    {
+      "id": "patch_sample_text",
+      "prompt": "Update sample.txt so the guarded marker is present.",
+      "fixture_repo": "fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt",
+      "verifier": "python -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'alpha-guarded' in text\"",
+      "category": "text-edit",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"sample.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"sample.txt\",\"old_text\":\"alpha\",\"new_text\":\"alpha-guarded\"}}</tool>",
+        "<final>sample.txt updated.</final>"
+      ]
+    }
+  ]
+}
