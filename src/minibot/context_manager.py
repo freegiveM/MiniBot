@@ -30,6 +30,10 @@ TOOL_METADATA_PROMPT_FIELDS = (
     "truncated",
     "artifact_ref",
     "stop_reason",
+    "delegate_id",
+    "delegate_artifact",
+    "delegate_child_run_id",
+    "delegate_schema_valid",
 )
 TOOL_OBSERVATION_BUDGET_CHARS = 480
 TRUNCATED_TOOL_OBSERVATION_NOTE = (

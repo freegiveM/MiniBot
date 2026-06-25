@@ -199,7 +199,7 @@ BASE_TOOL_SPECS = {
     "delegate": ToolSpec(
         name="delegate",
         description="Ask a bounded read-only child agent to investigate.",
-        schema={"task": "str", "max_steps": "int=3"},
+        schema={"task": "str", "allowed_tools": "list=[]", "max_steps": "int=3", "read_only": "bool=True"},
     ),
 }
 
@@ -331,6 +331,10 @@ def _validate_schema_args(schema: dict, args: dict) -> None:
             raise ValueError(f"arg must be a string: {key}")
         if kind == "int":
             _int_arg(args[key], key)
+        if kind == "bool" and not isinstance(args[key], bool):
+            raise ValueError(f"arg must be a boolean: {key}")
+        if kind == "list" and not isinstance(args[key], list):
+            raise ValueError(f"arg must be a list: {key}")
 
 
 def _validate_tool_call(agent, name: str, args: dict) -> None:
@@ -380,12 +384,11 @@ def _validate_tool_call(agent, name: str, args: dict) -> None:
     elif name == "todo_write":
         TodoState().set_items(_todo_items_from_args(args))
     elif name == "delegate":
+        from .delegate import DelegateTask
+
         if agent.depth >= agent.max_depth:
             raise ValueError("delegate depth exceeded")
-        _required_str(args, "task")
-        max_steps = _optional_int(args, "max_steps", 3)
-        if max_steps < 1:
-            raise ValueError("max_steps must be positive")
+        DelegateTask.from_args(args)
     else:
         raise ValueError(f"unknown tool: {name}")
 
@@ -526,23 +529,10 @@ def tool_todo_write(agent, args: dict) -> ToolObservation:
     )
 
 
-def tool_delegate(agent, args: dict) -> str:
-    from .runtime import MiniBot
+def tool_delegate(agent, args: dict) -> ToolObservation:
+    from .delegate import run_delegate
 
-    child = MiniBot(
-        model_client=agent.model_client,
-        workspace=agent.workspace,
-        session_store=agent.session_store,
-        run_store=agent.run_store,
-        approval_policy="never",
-        max_steps=int(args.get("max_steps", 3)),
-        max_new_tokens=agent.max_new_tokens,
-        depth=agent.depth + 1,
-        max_depth=agent.max_depth,
-        read_only=True,
-    )
-    result = child.ask(str(args.get("task", "")).strip())
-    return "delegate_result:\n" + clip(result, 2000)
+    return run_delegate(agent, args)
 
 
 _TOOL_RUNNERS = {
