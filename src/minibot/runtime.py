@@ -140,6 +140,7 @@ class MiniBot:
                 "last_promotion_at": "",
             },
             "pending_delegates": [],
+            "delegate_artifacts": [],
         }
 
     def _ensure_session_shape(self) -> None:
@@ -151,6 +152,7 @@ class MiniBot:
         self.session.pop("checkpoints", None)
         self.session.setdefault("runs", {"last_run_id": "", "recent_run_ids": []})
         self.session.setdefault("pending_delegates", [])
+        self.session.setdefault("delegate_artifacts", [])
 
     def build_prefix(self) -> str:
         tool_lines = []
@@ -500,6 +502,7 @@ class MiniBot:
             "session_id": self.session.get("id", ""),
             "prompt_metadata": self.last_prompt_metadata,
             "hooks": self._hook_report(),
+            "delegate_artifacts": list(self.session.get("delegate_artifacts", [])),
             "memory": {
                 "file_access_count": len(self.memory.to_dict().get("file_access", {})),
                 "episodic_note_count": len(self.memory.to_dict().get("episodic_notes", [])),
