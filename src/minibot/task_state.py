@@ -36,6 +36,7 @@ STOP_REASON_MODEL_ERROR = "model_error"
 STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_TOOL_ERROR = "tool_error"
 STOP_REASON_RUNTIME_ERROR = "runtime_error"
+STOP_REASON_PROMPT_TOO_LONG = "prompt_too_long"
 
 VALID_STOP_REASONS = frozenset(
     {
@@ -46,6 +47,7 @@ VALID_STOP_REASONS = frozenset(
         STOP_REASON_APPROVAL_DENIED,
         STOP_REASON_TOOL_ERROR,
         STOP_REASON_RUNTIME_ERROR,
+        STOP_REASON_PROMPT_TOO_LONG,
     }
 )
 
