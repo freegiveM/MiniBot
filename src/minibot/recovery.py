@@ -59,8 +59,8 @@ class RecoveryPolicy:
             kind=RECOVERY_TOOL_SCHEMA_ERROR,
             action=ACTION_RETURN_OBSERVATION,
             message=(
-                f"{tool_name} arguments were invalid. Fix the tool call schema or read the "
-                "relevant context before retrying."
+                f"tool error: {tool_name} arguments were invalid. Fix the tool call schema or read the "
+                f"relevant context before retrying. Details: {clip(str(error), 300)}"
             ),
             details={"tool_name": str(tool_name), "args": dict(args or {}), "error": clip(str(error), 500)},
         )
