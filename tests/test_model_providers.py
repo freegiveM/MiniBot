@@ -60,6 +60,8 @@ class ModelProviderTests(unittest.TestCase):
                         "MINIBOT_BASE_URL=https://dotenv.test/chat",
                         "MINIBOT_API_KEY_ENV=CUSTOM_KEY",
                         "CUSTOM_KEY=dotenv-key",
+                        "MINIBOT_PROMPT_CACHE=openai_explicit",
+                        "MINIBOT_PROMPT_CACHE_RETENTION=24h",
                     ]
                 ),
                 encoding="utf-8",
@@ -78,6 +80,8 @@ class ModelProviderTests(unittest.TestCase):
             self.assertEqual(config.base_url, "https://cli.test/messages")
             self.assertEqual(config.api_key, "dotenv-key")
             self.assertEqual(config.api_key_env, "CUSTOM_KEY")
+            self.assertEqual(config.prompt_cache, "openai_explicit")
+            self.assertEqual(config.prompt_cache_retention, "24h")
 
     def test_resolve_provider_config_defaults_deepseek_base_url_by_api_format(self):
         openai_config = resolve_provider_config(
@@ -322,6 +326,115 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(shape["content_block_types"], ["thinking"])
         self.assertEqual(shape["content_block_keys"], [["thinking", "type"]])
         self.assertNotIn("hidden", json.dumps(client.last_completion_metadata))
+
+    def test_openai_provider_sends_prompt_cache_key_and_in_memory_retention(self):
+        captured = []
+
+        def transport(request):
+            captured.append(request)
+            return HTTPResponse(
+                200,
+                json.dumps(
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 2,
+                            "total_tokens": 12,
+                            "prompt_tokens_details": {"cached_tokens": 7},
+                        },
+                    }
+                ),
+            )
+
+        client = HTTPModelClient(
+            ProviderConfig(
+                provider="openai",
+                api_format=API_FORMAT_OPENAI,
+                model_name="gpt-mini",
+                base_url="https://api.openai.com/v1/chat/completions",
+                api_key="secret",
+                prompt_cache="auto",
+                prompt_cache_retention="in-memory",
+            ),
+            transport=transport,
+        )
+
+        self.assertTrue(client.supports_prompt_cache)
+        self.assertEqual(
+            client.complete("hello", 16, prompt_cache_key="cache-key", prompt_cache_retention="in-memory"),
+            "ok",
+        )
+        request_payload = json.loads(captured[0].body)
+        self.assertEqual(request_payload["prompt_cache_key"], "cache-key")
+        self.assertEqual(request_payload["prompt_cache_retention"], "in-memory")
+        self.assertEqual(client.last_completion_metadata["cached_tokens"], 7)
+        self.assertTrue(client.last_completion_metadata["cache_hit"])
+        self.assertTrue(client.last_completion_metadata["prompt_cache_supported"])
+
+    def test_fake_anthropic_and_deepseek_do_not_send_openai_cache_fields_by_default(self):
+        captured_http = []
+        captured_anthropic = []
+        captured_deepseek = []
+
+        def http_transport(request):
+            captured_http.append(json.loads(request.body))
+            if "messages" in json.loads(request.body):
+                return HTTPResponse(200, json.dumps({"choices": [{"message": {"content": "ok"}}]}))
+
+        def anthropic_transport(request):
+            captured_anthropic.append(json.loads(request.body))
+            return HTTPResponse(200, json.dumps({"content": [{"type": "text", "text": "ok"}]}))
+
+        def deepseek_transport(request):
+            captured_deepseek.append(json.loads(request.body))
+            return HTTPResponse(200, json.dumps({"choices": [{"message": {"content": "ok"}}]}))
+
+        http_client = HTTPModelClient(
+            ProviderConfig(
+                provider="http",
+                api_format=API_FORMAT_OPENAI,
+                model_name="mini",
+                base_url="https://proxy.test/v1/chat/completions",
+                api_key="secret",
+            ),
+            transport=http_transport,
+        )
+        anthropic_client = HTTPModelClient(
+            ProviderConfig(
+                provider="anthropic",
+                api_format=API_FORMAT_ANTHROPIC,
+                model_name="claude-mini",
+                base_url="https://example.test/messages",
+                api_key="secret",
+                prompt_cache="openai_explicit",
+            ),
+            transport=anthropic_transport,
+        )
+        deepseek_client = HTTPModelClient(
+            ProviderConfig(
+                provider=PROVIDER_DEEPSEEK,
+                api_format=API_FORMAT_OPENAI,
+                model_name="deepseek-v4-pro",
+                base_url="https://api.deepseek.com",
+                api_key="secret",
+            ),
+            transport=deepseek_transport,
+        )
+
+        http_client.complete("hello", 16, prompt_cache_key="ignored")
+        anthropic_client.complete("hello", 16, prompt_cache_key="ignored")
+        deepseek_client.complete("hello", 16, prompt_cache_key="ignored")
+
+        self.assertFalse(http_client.supports_prompt_cache)
+        self.assertFalse(anthropic_client.supports_prompt_cache)
+        self.assertFalse(deepseek_client.supports_prompt_cache)
+        self.assertNotIn("prompt_cache_key", captured_http[0])
+        self.assertNotIn("prompt_cache_retention", captured_http[0])
+        self.assertNotIn("prompt_cache_key", captured_anthropic[0])
+        self.assertNotIn("prompt_cache_retention", captured_anthropic[0])
+        self.assertNotIn("prompt_cache_key", captured_deepseek[0])
+        self.assertNotIn("prompt_cache_retention", captured_deepseek[0])
 
 
 if __name__ == "__main__":

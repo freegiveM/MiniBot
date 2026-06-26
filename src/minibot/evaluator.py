@@ -15,6 +15,7 @@ from typing import Callable
 from .context_manager import ContextManager
 from .models import FakeModelClient
 from .model_providers import ProviderConfig, build_model_client_from_config, resolve_provider_config
+from .prompt_cache import PROMPT_CACHE_MODES, PROMPT_CACHE_RETENTIONS
 from .runtime import MiniBot, SessionStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED, STOP_REASON_MODEL_ERROR, STOP_REASON_TOOL_ERROR
 from .tools import ToolRegistry
@@ -165,6 +166,8 @@ def run_fixed_benchmark(
     base_url: str | None = None,
     api_key_env: str | None = None,
     env_file: str | Path = ".env",
+    prompt_cache: str | None = None,
+    prompt_cache_retention: str | None = None,
     temperature: float = 0.0,
     max_new_tokens: int = 512,
     max_tasks: int | None = None,
@@ -185,6 +188,8 @@ def run_fixed_benchmark(
         base_url=base_url,
         api_key_env=api_key_env,
         env_file=env_file,
+        prompt_cache=prompt_cache,
+        prompt_cache_retention=prompt_cache_retention,
         temperature=temperature,
         max_new_tokens=max_new_tokens,
         max_tasks=max_tasks,
@@ -333,6 +338,7 @@ class _DecodingModelClient:
         self.temperature = float(temperature)
         self.supports_prompt_cache = bool(getattr(inner, "supports_prompt_cache", False))
         self.model = str(getattr(inner, "model", "") or getattr(getattr(inner, "config", None), "model_name", ""))
+        self.config = getattr(inner, "config", None)
 
     @property
     def last_completion_metadata(self) -> dict:
@@ -354,6 +360,8 @@ def _benchmark_run_config(
     base_url: str | None,
     api_key_env: str | None,
     env_file: str | Path,
+    prompt_cache: str | None,
+    prompt_cache_retention: str | None,
     temperature: float,
     max_new_tokens: int,
     max_tasks: int | None,
@@ -376,6 +384,8 @@ def _benchmark_run_config(
             model_name=model_name,
             base_url=base_url,
             api_key_env=api_key_env,
+            prompt_cache=prompt_cache,
+            prompt_cache_retention=prompt_cache_retention,
         )
     elif mode == MODE_REAL and model_client_factory is None and dry_run and model_provider:
         provider_config = _dry_run_provider_config(
@@ -386,6 +396,8 @@ def _benchmark_run_config(
             model_name=model_name,
             base_url=base_url,
             api_key_env=api_key_env,
+            prompt_cache=prompt_cache,
+            prompt_cache_retention=prompt_cache_retention,
         )
     return BenchmarkRunConfig(
         mode=mode,
@@ -408,6 +420,8 @@ def _dry_run_provider_config(
     model_name: str | None,
     base_url: str | None,
     api_key_env: str | None,
+    prompt_cache: str | None,
+    prompt_cache_retention: str | None,
 ) -> ProviderConfig | None:
     try:
         return resolve_provider_config(
@@ -418,6 +432,8 @@ def _dry_run_provider_config(
             model_name=model_name,
             base_url=base_url,
             api_key_env=api_key_env,
+            prompt_cache=prompt_cache,
+            prompt_cache_retention=prompt_cache_retention,
         )
     except Exception:
         return None
@@ -801,6 +817,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
     parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
     parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
+    parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-tasks", type=int, default=None)
@@ -822,6 +840,8 @@ def main(argv: list[str] | None = None) -> int:
         base_url=args.base_url,
         api_key_env=args.api_key_env,
         env_file=args.env_file,
+        prompt_cache=args.prompt_cache,
+        prompt_cache_retention=args.prompt_cache_retention,
         temperature=args.temperature,
         max_new_tokens=args.max_new_tokens,
         max_tasks=args.max_tasks,

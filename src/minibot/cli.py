@@ -30,6 +30,7 @@ from .model_providers import (
     build_model_client_from_config,
     resolve_provider_config,
 )
+from .prompt_cache import PROMPT_CACHE_MODES, PROMPT_CACHE_RETENTIONS
 from .repl import run_repl
 from .runtime import MiniBot, SessionStore
 from .workspace import WorkspaceContext
@@ -70,6 +71,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
     parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
     parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
+    parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument(
         "--fake-response",
         default="<final>MiniBot scaffold is running.</final>",
@@ -91,6 +94,8 @@ def build_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
     parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
     parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
+    parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Provider decoding temperature.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum provider output tokens.")
     parser.add_argument("--max-tasks", type=int, default=None, help="Limit benchmark tasks.")
@@ -134,6 +139,8 @@ def build_repl_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
     parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
     parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
+    parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument(
         "--fake-response",
         default="<final>MiniBot scaffold is running.</final>",
@@ -163,6 +170,8 @@ def build_agent_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
     parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
     parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
+    parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument(
         "--fake-response",
         default="<final>MiniBot scaffold is running.</final>",
@@ -215,6 +224,8 @@ def run_agent_command(argv: list[str]) -> int:
             model_name=parsed.model_name,
             base_url=parsed.base_url,
             api_key_env=parsed.api_key_env,
+            prompt_cache=parsed.prompt_cache,
+            prompt_cache_retention=parsed.prompt_cache_retention,
             fake_response=parsed.fake_response,
         )
     except ProviderConfigurationError as exc:
@@ -256,6 +267,8 @@ def run_benchmark_command(argv: list[str]) -> int:
             base_url=parsed.base_url,
             api_key_env=parsed.api_key_env,
             env_file=_resolve_cli_path(cwd, parsed.env_file),
+            prompt_cache=parsed.prompt_cache,
+            prompt_cache_retention=parsed.prompt_cache_retention,
             temperature=parsed.temperature,
             max_new_tokens=parsed.max_new_tokens,
             max_tasks=parsed.max_tasks,
@@ -325,6 +338,8 @@ def run_repl_command(argv: list[str]) -> int:
             model_name=parsed.model_name,
             base_url=parsed.base_url,
             api_key_env=parsed.api_key_env,
+            prompt_cache=parsed.prompt_cache,
+            prompt_cache_retention=parsed.prompt_cache_retention,
             fake_response=parsed.fake_response,
         )
     except ProviderConfigurationError as exc:
@@ -352,6 +367,8 @@ def build_model_client(
     model_name: str | None = None,
     base_url: str | None = None,
     api_key_env: str | None = None,
+    prompt_cache: str | None = None,
+    prompt_cache_retention: str | None = None,
     fake_response: str = "<final>MiniBot scaffold is running.</final>",
 ):
     config = resolve_provider_config(
@@ -362,6 +379,8 @@ def build_model_client(
         model_name=model_name,
         base_url=base_url,
         api_key_env=api_key_env,
+        prompt_cache=prompt_cache,
+        prompt_cache_retention=prompt_cache_retention,
     )
     return build_model_client_from_config(config, fake_response=fake_response)
 

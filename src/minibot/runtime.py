@@ -390,9 +390,12 @@ class MiniBot:
                     event = self.recovery_policy.prompt_still_too_long(prompt_metadata)
                 self._record_recovery(event, task_state)
                 return self._stop_run(task_state, STOP_REASON_PROMPT_TOO_LONG, event.message)
+            cache_kwargs = self._prompt_cache_kwargs(prompt_metadata)
+            self.emit_trace(task_state, "model_requested", self._model_requested_metadata(prompt_metadata, cache_kwargs))
             try:
-                raw = self.model_client.complete(prompt, self.max_new_tokens)
+                raw = self.model_client.complete(prompt, self.max_new_tokens, **cache_kwargs)
             except Exception as exc:
+                self._record_prompt_cache_result(prompt_metadata)
                 self._model_error_retries += 1
                 event = self.recovery_policy.model_error(exc, self._model_error_retries)
                 self._record_recovery(event, task_state)
@@ -405,6 +408,15 @@ class MiniBot:
                     continue
                 final = f"Stopped after model error: {exc}"
                 return self._stop_run(task_state, STOP_REASON_MODEL_ERROR, final, status=STATUS_FAILED)
+            self._record_prompt_cache_result(prompt_metadata)
+            self.emit_trace(
+                task_state,
+                "model_completed",
+                {
+                    "prompt_metadata": prompt_metadata,
+                    "model": self._model_report(),
+                },
+            )
             kind, payload = self.parse(raw)
             self.emit_trace(task_state, "model_parsed", {"kind": kind})
 
@@ -450,6 +462,53 @@ class MiniBot:
         )
         reason = STOP_REASON_RETRY_LIMIT_REACHED if attempts >= self._attempt_limit() else STOP_REASON_STEP_LIMIT_REACHED
         return self._stop_run(task_state, reason, final)
+
+    def _prompt_cache_kwargs(self, prompt_metadata: dict) -> dict:
+        plan = prompt_metadata.get("prompt_cache", {}) if isinstance(prompt_metadata, dict) else {}
+        if not isinstance(plan, dict):
+            return {}
+        if not bool(getattr(self.model_client, "supports_prompt_cache", False)):
+            return {}
+        if not bool(plan.get("eligible")):
+            return {}
+        key = str(plan.get("prompt_cache_key") or "")
+        if not key:
+            return {}
+        return {
+            "prompt_cache_key": key,
+            "prompt_cache_retention": str(plan.get("retention") or "in-memory"),
+        }
+
+    def _model_requested_metadata(self, prompt_metadata: dict, cache_kwargs: dict) -> dict:
+        plan = prompt_metadata.get("prompt_cache", {}) if isinstance(prompt_metadata, dict) else {}
+        if not isinstance(plan, dict):
+            plan = {}
+        return {
+            "prompt_cache_key": str(plan.get("prompt_cache_key") or ""),
+            "prompt_cache_eligible": bool(plan.get("eligible")),
+            "provider_mode": str(plan.get("provider_mode") or ""),
+            "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+            "prompt_cache_sent": bool(cache_kwargs),
+            "prompt_cache_retention": str(plan.get("retention") or ""),
+        }
+
+    def _record_prompt_cache_result(self, prompt_metadata: dict) -> None:
+        model = self._model_report()
+        prompt_cache = prompt_metadata.setdefault("prompt_cache", {})
+        if not isinstance(prompt_cache, dict):
+            prompt_cache = {}
+            prompt_metadata["prompt_cache"] = prompt_cache
+        for key in (
+            "prompt_cache_supported",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "cached_tokens",
+            "cache_hit",
+        ):
+            if key in model:
+                prompt_cache[key] = model[key]
+                prompt_metadata[key] = model[key]
+        self.last_prompt_metadata = prompt_metadata
 
     @staticmethod
     def _affected_paths(args: dict) -> list[str]:

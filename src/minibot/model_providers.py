@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from .models import FakeModelClient
+from .prompt_cache import (
+    PROMPT_CACHE_AUTO,
+    PROMPT_CACHE_RETENTION_IN_MEMORY,
+    normalize_prompt_cache_mode,
+    normalize_prompt_cache_retention,
+    provider_supports_prompt_cache,
+)
 
 
 PROVIDER_FAKE = "fake"
@@ -37,6 +44,8 @@ BASE_URL_ENV = "MINIBOT_BASE_URL"
 API_KEY_ENV = "MINIBOT_API_KEY"
 API_KEY_ENV_NAME_ENV = "MINIBOT_API_KEY_ENV"
 TIMEOUT_ENV = "MINIBOT_TIMEOUT_SECONDS"
+PROMPT_CACHE_ENV = "MINIBOT_PROMPT_CACHE"
+PROMPT_CACHE_RETENTION_ENV = "MINIBOT_PROMPT_CACHE_RETENTION"
 
 
 class ModelProviderError(RuntimeError):
@@ -84,6 +93,8 @@ class ProviderConfig:
     api_key_env: str = DEFAULT_API_KEY_ENV
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     env_file: str = DEFAULT_ENV_FILE
+    prompt_cache: str = PROMPT_CACHE_AUTO
+    prompt_cache_retention: str = PROMPT_CACHE_RETENTION_IN_MEMORY
 
     def safe_metadata(self) -> dict:
         return {
@@ -94,6 +105,8 @@ class ProviderConfig:
             "api_key_present": bool(self.api_key),
             "api_key_env": self.api_key_env,
             "timeout_seconds": self.timeout_seconds,
+            "prompt_cache": self.prompt_cache,
+            "prompt_cache_retention": self.prompt_cache_retention,
         }
 
 
@@ -101,19 +114,30 @@ Transport = Callable[[HTTPRequest], HTTPResponse]
 
 
 class HTTPModelClient:
-    supports_prompt_cache = False
-
     def __init__(self, config: ProviderConfig, transport: Transport | None = None):
         if config.provider == PROVIDER_FAKE:
             raise ProviderConfigurationError("HTTPModelClient requires a non-fake provider")
         self.config = config
         self.transport = transport or _urllib_transport
         self.last_completion_metadata: dict = {}
+        self.supports_prompt_cache = provider_supports_prompt_cache(
+            provider=config.provider,
+            api_format=config.api_format,
+            prompt_cache=config.prompt_cache,
+        )
 
     def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
         started = time.perf_counter()
         temperature = kwargs.get("temperature")
-        request = self._build_request(prompt, max_new_tokens, temperature=temperature)
+        prompt_cache_key = str(kwargs.get("prompt_cache_key") or "")
+        prompt_cache_retention = str(kwargs.get("prompt_cache_retention") or self.config.prompt_cache_retention)
+        request = self._build_request(
+            prompt,
+            max_new_tokens,
+            temperature=temperature,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+        )
         response_status_code = 0
         response_shape: dict = {}
         try:
@@ -133,7 +157,9 @@ class HTTPModelClient:
                 "output_chars": len(text),
                 "latency_ms": latency_ms,
                 "retry_count": 0,
-                "prompt_cache_supported": False,
+                "prompt_cache_supported": self.supports_prompt_cache,
+                "prompt_cache_key": prompt_cache_key if self.supports_prompt_cache else "",
+                "prompt_cache_retention": prompt_cache_retention if self.supports_prompt_cache else "",
                 "status_code": response.status_code,
                 "error_category": "",
                 **usage,
@@ -148,7 +174,9 @@ class HTTPModelClient:
                 "output_chars": 0,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
                 "retry_count": 0,
-                "prompt_cache_supported": False,
+                "prompt_cache_supported": self.supports_prompt_cache,
+                "prompt_cache_key": prompt_cache_key if self.supports_prompt_cache else "",
+                "prompt_cache_retention": prompt_cache_retention if self.supports_prompt_cache else "",
                 "error_category": _error_category(exc),
                 "error": str(exc),
             }
@@ -156,19 +184,44 @@ class HTTPModelClient:
                 self.last_completion_metadata["status_code"] = response_status_code
             raise
 
-    def _build_request(self, prompt: str, max_new_tokens: int, *, temperature=None) -> HTTPRequest:
+    def _build_request(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        *,
+        temperature=None,
+        prompt_cache_key: str = "",
+        prompt_cache_retention: str = PROMPT_CACHE_RETENTION_IN_MEMORY,
+    ) -> HTTPRequest:
         if self.config.api_format == API_FORMAT_OPENAI:
-            return self._build_openai_request(prompt, max_new_tokens, temperature=temperature)
+            return self._build_openai_request(
+                prompt,
+                max_new_tokens,
+                temperature=temperature,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
         if self.config.api_format == API_FORMAT_ANTHROPIC:
             return self._build_anthropic_request(prompt, max_new_tokens, temperature=temperature)
         raise ProviderConfigurationError(f"unsupported api_format: {self.config.api_format}")
 
-    def _build_openai_request(self, prompt: str, max_new_tokens: int, *, temperature=None) -> HTTPRequest:
+    def _build_openai_request(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        *,
+        temperature=None,
+        prompt_cache_key: str = "",
+        prompt_cache_retention: str = PROMPT_CACHE_RETENTION_IN_MEMORY,
+    ) -> HTTPRequest:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": int(max_new_tokens),
         }
+        if self.supports_prompt_cache and prompt_cache_key:
+            payload["prompt_cache_key"] = prompt_cache_key
+            payload["prompt_cache_retention"] = normalize_prompt_cache_retention(prompt_cache_retention)
         if _is_deepseek_endpoint(self.config):
             payload["thinking"] = {"type": "disabled"}
         if temperature is not None:
@@ -244,6 +297,8 @@ def resolve_provider_config(
     base_url: str | None = None,
     api_key_env: str | None = None,
     timeout_seconds: float | str | None = None,
+    prompt_cache: str | None = None,
+    prompt_cache_retention: str | None = None,
 ) -> ProviderConfig:
     cwd_path = Path(cwd).resolve()
     env_file_path = Path(env_file)
@@ -262,6 +317,10 @@ def resolve_provider_config(
     resolved_api_key_env = _coalesce(api_key_env, merged.get(API_KEY_ENV_NAME_ENV), DEFAULT_API_KEY_ENV)
     resolved_api_key = _coalesce(merged.get(API_KEY_ENV), merged.get(resolved_api_key_env), "")
     resolved_timeout = _float_value(_coalesce(timeout_seconds, merged.get(TIMEOUT_ENV), DEFAULT_TIMEOUT_SECONDS))
+    resolved_prompt_cache = _prompt_cache_mode(_coalesce(prompt_cache, merged.get(PROMPT_CACHE_ENV), PROMPT_CACHE_AUTO))
+    resolved_prompt_cache_retention = _prompt_cache_retention(
+        _coalesce(prompt_cache_retention, merged.get(PROMPT_CACHE_RETENTION_ENV), PROMPT_CACHE_RETENTION_IN_MEMORY)
+    )
 
     config = ProviderConfig(
         provider=provider,
@@ -272,6 +331,8 @@ def resolve_provider_config(
         api_key_env=resolved_api_key_env,
         timeout_seconds=resolved_timeout,
         env_file=str(env_file_path),
+        prompt_cache=resolved_prompt_cache,
+        prompt_cache_retention=resolved_prompt_cache_retention,
     )
     _validate_provider_config(config)
     return config
@@ -309,6 +370,7 @@ def _parse_openai_chat_response(payload: dict) -> tuple[str, dict]:
         input_tokens=usage.get("prompt_tokens") if isinstance(usage, dict) else None,
         output_tokens=usage.get("completion_tokens") if isinstance(usage, dict) else None,
         total_tokens=usage.get("total_tokens") if isinstance(usage, dict) else None,
+        cached_tokens=_cached_tokens_from_usage(usage) if isinstance(usage, dict) else None,
     )
 
 
@@ -330,10 +392,11 @@ def _parse_anthropic_messages_response(payload: dict) -> tuple[str, dict]:
     return text, _usage_metadata(
         input_tokens=usage.get("input_tokens") if isinstance(usage, dict) else None,
         output_tokens=usage.get("output_tokens") if isinstance(usage, dict) else None,
+        cached_tokens=_cached_tokens_from_usage(usage) if isinstance(usage, dict) else None,
     )
 
 
-def _usage_metadata(input_tokens=None, output_tokens=None, total_tokens=None) -> dict:
+def _usage_metadata(input_tokens=None, output_tokens=None, total_tokens=None, cached_tokens=None) -> dict:
     result = {}
     if input_tokens is not None:
         result["input_tokens"] = int(input_tokens)
@@ -343,7 +406,20 @@ def _usage_metadata(input_tokens=None, output_tokens=None, total_tokens=None) ->
         result["total_tokens"] = int(total_tokens)
     elif input_tokens is not None and output_tokens is not None:
         result["total_tokens"] = int(input_tokens) + int(output_tokens)
+    if cached_tokens is not None:
+        result["cached_tokens"] = int(cached_tokens)
+        result["cache_hit"] = int(cached_tokens) > 0
     return result
+
+
+def _cached_tokens_from_usage(usage: dict) -> int | None:
+    for key in ("input_tokens_details", "prompt_tokens_details"):
+        details = usage.get(key)
+        if isinstance(details, dict) and details.get("cached_tokens") is not None:
+            return int(details.get("cached_tokens") or 0)
+    if usage.get("cached_tokens") is not None:
+        return int(usage.get("cached_tokens") or 0)
+    return None
 
 
 def _urllib_transport(request: HTTPRequest) -> HTTPResponse:
@@ -569,6 +645,20 @@ def _float_value(value) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ProviderConfigurationError(f"timeout_seconds must be a number: {value}") from exc
+
+
+def _prompt_cache_mode(value: str) -> str:
+    try:
+        return normalize_prompt_cache_mode(value)
+    except ValueError as exc:
+        raise ProviderConfigurationError(str(exc)) from exc
+
+
+def _prompt_cache_retention(value: str) -> str:
+    try:
+        return normalize_prompt_cache_retention(value)
+    except ValueError as exc:
+        raise ProviderConfigurationError(str(exc)) from exc
 
 
 def _error_category(exc: Exception) -> str:

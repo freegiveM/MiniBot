@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 
+from . import tools as toolkit
+from .prompt_cache import CACHEABLE_PREFIX_SECTIONS, DYNAMIC_SECTIONS, build_prompt_cache_plan
+
 
 DEFAULT_TOTAL_BUDGET_CHARS = 8000
 SECTION_ORDER = (
@@ -53,6 +56,7 @@ class PromptSection:
     truncated: bool = False
     truncation_reason: str = ""
     preserved: bool = False
+    cache_class: str = "dynamic"
 
     def metadata(self) -> dict:
         return {
@@ -63,6 +67,7 @@ class PromptSection:
             "truncated": self.truncated,
             "truncation_reason": self.truncation_reason,
             "preserved": self.preserved,
+            "cache_class": self.cache_class,
         }
 
 
@@ -112,6 +117,7 @@ class ContextManager:
         raw_prompt_chars = len(raw_prompt)
         sections, compact_summary = self._compact_sections(sections, raw_prompt_chars)
         prompt = self._join_sections(sections)
+        prompt_cache_plan = self._build_prompt_cache_plan(sections)
         metadata = {
             "section_order": list(SECTION_ORDER),
             "sections": {section.name: section.metadata() for section in sections},
@@ -129,6 +135,12 @@ class ContextManager:
                 "truncated": False,
                 "preserved": True,
             },
+            "prompt_cache": prompt_cache_plan.to_dict(),
+            "stable_prefix_hash": prompt_cache_plan.stable_prefix_hash,
+            "prompt_cache_key": prompt_cache_plan.prompt_cache_key,
+            "cacheable_sections": list(prompt_cache_plan.cacheable_sections),
+            "dynamic_sections": list(prompt_cache_plan.dynamic_sections),
+            "prompt_cache_eligible": prompt_cache_plan.eligible,
         }
         if compact_summary:
             compact_summary["final_prompt_chars"] = len(prompt)
@@ -136,6 +148,28 @@ class ContextManager:
             compact_summary["over_total_budget"] = metadata["over_total_budget"]
             metadata["compact_summary"] = compact_summary
         return prompt, metadata
+
+    def _build_prompt_cache_plan(self, sections: list[PromptSection]):
+        config = getattr(self.agent.model_client, "config", None)
+        provider = str(getattr(config, "provider", "") or self.agent.model_client.__class__.__name__)
+        api_format = str(getattr(config, "api_format", "openai") or "openai")
+        model_name = str(
+            getattr(self.agent.model_client, "model", "")
+            or getattr(config, "model_name", "")
+            or ""
+        )
+        prompt_cache = str(getattr(config, "prompt_cache", "auto") or "auto")
+        retention = str(getattr(config, "prompt_cache_retention", "in-memory") or "in-memory")
+        return build_prompt_cache_plan(
+            sections=sections,
+            workspace_fingerprint=self.agent.workspace.fingerprint(),
+            tool_signature=toolkit.tool_signature(self.agent.tools),
+            provider=provider,
+            api_format=api_format,
+            model_name=model_name,
+            prompt_cache=prompt_cache,
+            retention=retention,
+        )
 
     @staticmethod
     def _join_sections(sections: list[PromptSection]) -> str:
@@ -250,6 +284,7 @@ class ContextManager:
     def _section(self, name: str, text: object, source: str) -> PromptSection:
         raw_text = str(text)
         budget = self._section_budget(name)
+        cache_class = self._section_cache_class(name)
         if name == "current_request":
             return PromptSection(
                 name=name,
@@ -260,6 +295,7 @@ class ContextManager:
                 truncated=False,
                 truncation_reason="",
                 preserved=True,
+                cache_class=cache_class,
             )
         rendered, truncated = self._apply_section_budget(raw_text, budget)
         return PromptSection(
@@ -270,7 +306,16 @@ class ContextManager:
             budget_chars=budget,
             truncated=truncated,
             truncation_reason="section_budget_exceeded" if truncated else "",
+            cache_class=cache_class,
         )
+
+    @staticmethod
+    def _section_cache_class(name: str) -> str:
+        if name in CACHEABLE_PREFIX_SECTIONS:
+            return "stable_prefix"
+        if name in DYNAMIC_SECTIONS:
+            return "dynamic"
+        return "dynamic"
 
     def _section_budget(self, name: str) -> int | None:
         if name not in self.section_budgets:

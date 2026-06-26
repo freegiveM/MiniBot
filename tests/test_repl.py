@@ -10,7 +10,36 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from minibot.models import FakeModelClient
+from minibot.model_providers import API_FORMAT_OPENAI, ProviderConfig
 from minibot.repl import run_repl
+
+
+class CacheAwareReplModelClient:
+    supports_prompt_cache = True
+
+    def __init__(self):
+        self.config = ProviderConfig(
+            provider="openai",
+            api_format=API_FORMAT_OPENAI,
+            model_name="gpt-mini",
+            prompt_cache="auto",
+        )
+        self.model = "gpt-mini"
+        self.calls: list[dict] = []
+        self.last_completion_metadata = {}
+
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+        del prompt, max_new_tokens
+        self.calls.append(dict(kwargs))
+        self.last_completion_metadata = {
+            "model": self.model,
+            "prompt_cache_supported": True,
+            "prompt_cache_key": kwargs.get("prompt_cache_key", ""),
+            "prompt_cache_retention": kwargs.get("prompt_cache_retention", ""),
+            "cached_tokens": 0,
+            "cache_hit": False,
+        }
+        return f"<final>turn {len(self.calls)}</final>"
 
 
 class ReplTests(unittest.TestCase):
@@ -119,6 +148,33 @@ class ReplTests(unittest.TestCase):
             self.assertEqual(saved["id"], session_id)
             self.assertEqual(saved["turn_count"], 2)
             self.assertEqual([item["content"] for item in saved["history"]], ["first", "First.", "second", "Second."])
+
+    def test_repl_reuses_cache_key_across_turns_when_stable_prefix_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            model = CacheAwareReplModelClient()
+
+            code = run_repl(
+                cwd=root,
+                model_client=model,
+                approval_policy="auto",
+                input_stream=io.StringIO("first request\nsecond request\n/exit\n"),
+                output_stream=io.StringIO(),
+                error_stream=io.StringIO(),
+            )
+
+            self.assertEqual(code, 0)
+            main_calls = [call for call in model.calls if call.get("prompt_cache_key")]
+            self.assertEqual(len(main_calls), 2)
+            self.assertEqual(main_calls[0]["prompt_cache_key"], main_calls[1]["prompt_cache_key"])
+            reports = sorted((root / ".minibot" / "runs").glob("*/report.json"))
+            keys = [
+                json.loads(path.read_text(encoding="utf-8"))["prompt_metadata"]["prompt_cache_key"]
+                for path in reports
+            ]
+            self.assertEqual(len(keys), 2)
+            self.assertEqual(keys[0], keys[1])
 
 
 if __name__ == "__main__":
