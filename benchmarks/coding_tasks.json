@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "description": "Fixed deterministic regression tasks for MiniBot core mechanisms.",
+  "tasks": [
+    {
+      "id": "docs_update_readme_status",
+      "prompt": "Update README.md so the documentation status is reviewed, while preserving unrelated guardrail text.",
+      "fixture_repo": "fixtures/docs_readme_status",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "README.md",
+      "verifier": "python verify.py",
+      "category": "documentation",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\",\"start\":1,\"end\":40}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"README.md\",\"old_text\":\"Status: draft\",\"new_text\":\"Status: reviewed\"}}</tool>",
+        "<final>README status updated.</final>"
+      ]
+    },
+    {
+      "id": "docs_update_usage_note",
+      "prompt": "Replace the TODO note in docs/USAGE.md with the benchmark artifact guidance, without changing the surrounding instructions.",
+      "fixture_repo": "fixtures/docs_usage_note",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "docs/USAGE.md",
+      "verifier": "python verify.py",
+      "category": "documentation",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"docs/USAGE.md\",\"start\":1,\"end\":40}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"docs/USAGE.md\",\"old_text\":\"Note: TODO\",\"new_text\":\"Note: Keep benchmark artifacts attached to reports.\"}}</tool>",
+        "<final>Usage note updated.</final>"
+      ]
+    },
+    {
+      "id": "text_replace_priority_label",
+      "prompt": "Change sample.txt priority from low to high and leave the header and footer untouched.",
+      "fixture_repo": "fixtures/text_priority_label",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "sample.txt",
+      "verifier": "python verify.py",
+      "category": "text-edit",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"sample.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"sample.txt\",\"old_text\":\"priority=low\",\"new_text\":\"priority=high\"}}</tool>",
+        "<final>Priority updated.</final>"
+      ]
+    },
+    {
+      "id": "text_update_release_marker",
+      "prompt": "Update notes.txt so the release marker is ready, preserving both alpha and omega markers.",
+      "fixture_repo": "fixtures/text_release_marker",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "notes.txt",
+      "verifier": "python verify.py",
+      "category": "text-edit",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"notes.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"notes.txt\",\"old_text\":\"release: pending\",\"new_text\":\"release: ready\"}}</tool>",
+        "<final>Release marker updated.</final>"
+      ]
+    },
+    {
+      "id": "code_fix_math_helper",
+      "prompt": "Fix the add helper in math_tools.py and run the fixture unit tests.",
+      "fixture_repo": "fixtures/code_math_helper",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 4,
+      "expected_artifact": "math_tools.py",
+      "verifier": "python -m unittest discover -s tests -v",
+      "category": "code-modification",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"math_tools.py\",\"start\":1,\"end\":80}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"math_tools.py\",\"old_text\":\"return a - b\",\"new_text\":\"return a + b\"}}</tool>",
+        "<tool>{\"name\":\"run_shell\",\"args\":{\"command\":\"python -m unittest discover -s tests -v\",\"timeout\":30}}</tool>",
+        "<final>add helper fixed and tests passed.</final>"
+      ]
+    },
+    {
+      "id": "code_normalize_name",
+      "prompt": "Implement normalize_name in formatter.py so it trims, lowercases, and converts spaces to hyphens. Run the fixture tests.",
+      "fixture_repo": "fixtures/code_formatter",
+      "allowed_tools": ["read_file", "patch_file", "run_shell"],
+      "step_budget": 4,
+      "expected_artifact": "formatter.py",
+      "verifier": "python -m unittest discover -s tests -v",
+      "category": "code-modification",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"formatter.py\",\"start\":1,\"end\":80}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"formatter.py\",\"old_text\":\"return name\",\"new_text\":\"return name.strip().lower().replace(\\\" \\\", \\\"-\\\")\"}}</tool>",
+        "<tool>{\"name\":\"run_shell\",\"args\":{\"command\":\"python -m unittest discover -s tests -v\",\"timeout\":30}}</tool>",
+        "<final>normalize_name implemented and tests passed.</final>"
+      ]
+    },
+    {
+      "id": "tool_boundary_path_escape_recovery",
+      "prompt": "Reject a path escape attempt, then recover by patching sample.txt inside the workspace.",
+      "fixture_repo": "fixtures/tool_path_escape",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt",
+      "verifier": "python verify.py",
+      "category": "tool-boundary",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"../outside.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"sample.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"sample.txt\",\"old_text\":\"alpha\",\"new_text\":\"alpha-guarded\"}}</tool>",
+        "<final>Path escape was rejected and sample.txt was updated.</final>"
+      ]
+    },
+    {
+      "id": "tool_boundary_schema_retry",
+      "prompt": "Recover from an invalid patch attempt, then update config.txt mode to new.",
+      "fixture_repo": "fixtures/tool_schema_retry",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "config.txt",
+      "verifier": "python verify.py",
+      "category": "tool-boundary",
+      "model_outputs": [
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"mode=missing\",\"new_text\":\"mode=new\"}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"config.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"mode=old\",\"new_text\":\"mode=new\"}}</tool>",
+        "<final>Recovered from the invalid patch and updated config.txt.</final>"
+      ]
+    },
+    {
+      "id": "context_compaction_preserves_request",
+      "prompt": "CONTEXT_REQUEST_MARKER: update context.txt marker from old to new after compacting old history.",
+      "fixture_repo": "fixtures/context_compaction",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "expected_artifact": "context.txt",
+      "verifier": "python verify.py",
+      "category": "context",
+      "setup": {
+        "kind": "context_reduction",
+        "history_count": 10,
+        "item_chars": 650,
+        "total_budget": 5200,
+        "latest_marker": "LATEST_CONTEXT_MARKER_KEEP"
+      },
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"context.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"context.txt\",\"old_text\":\"marker=old\",\"new_text\":\"marker=new\"}}</tool>",
+        "<final>Context marker updated after compaction.</final>"
+      ]
+    },
+    {
+      "id": "memory_read_project_decision",
+      "prompt": "Use project memory to update notes/decision.txt with the retained decision marker.",
+      "fixture_repo": "fixtures/memory_project_decision",
+      "allowed_tools": ["read_memory", "read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "notes/decision.txt",
+      "verifier": "python verify.py",
+      "category": "memory",
+      "setup": {
+        "kind": "memory_seed",
+        "project_memory": "Memory index:\\n- BENCH_POLICY: use alpha-retained as the decision marker.\\n- Guardrail: read project memory before changing decision notes."
+      },
+      "model_outputs": [
+        "<tool>{\"name\":\"read_memory\",\"args\":{\"topic\":\"index\",\"max_chars\":1000}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"notes/decision.txt\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"notes/decision.txt\",\"old_text\":\"decision=pending\",\"new_text\":\"decision=alpha-retained\"}}</tool>",
+        "<final>Decision note updated using project memory.</final>"
+      ]
+    },
+    {
+      "id": "recovery_stale_file_reread",
+      "prompt": "Update settings.ini flag and mode, rereading the file if stale write metadata blocks the second patch.",
+      "fixture_repo": "fixtures/recovery_stale_config",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 6,
+      "expected_artifact": "settings.ini",
+      "verifier": "python verify.py",
+      "category": "recovery",
+      "model_outputs": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"settings.ini\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"settings.ini\",\"old_text\":\"flag=old\",\"new_text\":\"flag=first\"}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"settings.ini\",\"old_text\":\"mode=passive\",\"new_text\":\"mode=active\"}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"settings.ini\",\"start\":1,\"end\":20}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"settings.ini\",\"old_text\":\"mode=passive\",\"new_text\":\"mode=active\"}}</tool>",
+        "<final>Recovered from stale file metadata by rereading before the second patch.</final>"
+      ]
+    },
+    {
+      "id": "delegate_hooks_bounded_summary",
+      "prompt": "Ask a delegate to inspect README.md for the marker, then finish with the bounded delegate finding.",
+      "fixture_repo": "fixtures/delegate_hooks",
+      "allowed_tools": ["delegate"],
+      "step_budget": 2,
+      "expected_artifact": ".minibot/delegates/bench_delegate.json",
+      "verifier": "python verify.py",
+      "category": "delegate/hooks",
+      "model_outputs": [
+        "<tool>{\"name\":\"delegate\",\"args\":{\"id\":\"bench_delegate\",\"task\":\"Inspect README.md for the delegate marker.\",\"allowed_tools\":[\"read_file\"],\"max_steps\":2}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\",\"start\":1,\"end\":20}}</tool>",
+        "<final>{\"summary\":\"README contains the delegate-ready marker.\",\"evidence\":[{\"file\":\"README.md\",\"line\":2,\"note\":\"marker found\"}],\"files_read\":[\"README.md\"],\"confidence\":\"high\",\"open_questions\":[],\"recommended_next_step\":\"Use the finding in the parent response.\"}</final>",
+        "<final>Delegate confirmed the README marker with bounded evidence.</final>"
+      ]
+    }
+  ]
+}
