@@ -58,6 +58,21 @@ class ContextManagerTests(unittest.TestCase):
                 self.assertFalse(section["truncated"])
                 self.assertEqual(section["truncation_reason"], "")
 
+    def test_identity_section_spells_out_tool_call_schema(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+
+            prompt, _ = agent.context_manager.build("inspect")
+
+            self.assertIn('<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":40}}</tool>', prompt)
+            self.assertIn('tool_batch_example: <tool>[{"name":"read_file"', prompt)
+            self.assertIn('every call needs "name" and "args"', prompt)
+            self.assertIn("schemas describe the args object", prompt)
+            self.assertIn("args_schema=", prompt)
+            self.assertIn("example_args=", prompt)
+
     def test_section_budget_can_truncate_non_current_request_only(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

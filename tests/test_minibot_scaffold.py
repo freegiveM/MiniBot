@@ -40,6 +40,22 @@ class MiniBotScaffoldTests(unittest.TestCase):
             self.assertNotIn("checkpoints", saved)
             self.assertEqual(saved["runs"]["last_run_id"], run_id)
 
+    def test_prefix_spells_out_tool_call_schema(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root, [])
+
+            self.assertIn("Tool protocol:", agent.prefix)
+            self.assertIn("Batch tools use", agent.prefix)
+            self.assertIn("<final>...</final>", agent.prefix)
+            self.assertIn('"name":"read_file"', agent.prefix)
+            self.assertIn('"args":{"path":"README.md"', agent.prefix)
+            self.assertIn("args_schema=", agent.prefix)
+            self.assertIn("example_args=", agent.prefix)
+            self.assertIn("schemas describe the args object", agent.prefix)
+            self.assertIn("Do not put tool arguments at the top level", agent.prefix)
+
     def test_read_file_records_file_access_without_file_summary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
