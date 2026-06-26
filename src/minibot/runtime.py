@@ -193,6 +193,7 @@ class MiniBot:
             "read_only": self.read_only,
             "approval_policy": self.approval_policy,
             "model_provider": self.model_client.__class__.__name__,
+            "model_name": str(getattr(self.model_client, "model", "") or getattr(getattr(self.model_client, "config", None), "model_name", "")),
         }
 
     def path(self, raw_path: str | Path) -> Path:
@@ -608,6 +609,7 @@ class MiniBot:
             "task_state": task_state.to_dict(),
             "todo_state": self.todo_state.to_dict(),
             "session_id": self.session.get("id", ""),
+            "model": self._model_report(),
             "prompt_metadata": self.last_prompt_metadata,
             "hooks": self._hook_report(),
             "delegate_artifacts": list(self.session.get("delegate_artifacts", [])),
@@ -621,6 +623,10 @@ class MiniBot:
                 "episodic_note_count": len(self.memory.to_dict().get("episodic_notes", [])),
             },
         }
+
+    def _model_report(self) -> dict:
+        metadata = getattr(self.model_client, "last_completion_metadata", {})
+        return dict(metadata) if isinstance(metadata, dict) else {}
 
     def _hook_report(self) -> dict:
         errors = []

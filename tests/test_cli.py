@@ -36,6 +36,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "README.md").write_text("demo\n", encoding="utf-8")
+            (root / ".env").write_text("MINIBOT_MODEL_PROVIDER=fake\nMINIBOT_MODEL_NAME=fake-from-env\n", encoding="utf-8")
 
             code, stdout, stderr = _capture_main(
                 [
@@ -59,6 +60,32 @@ class CliTests(unittest.TestCase):
             run_root = root / ".minibot" / "runs"
             self.assertTrue(run_root.exists())
             self.assertTrue(any(path.name == "report.json" for path in run_root.rglob("report.json")))
+
+    def test_cli_http_provider_reports_configuration_error_without_api_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+
+            code, stdout, stderr = _capture_main(
+                [
+                    "--cwd",
+                    str(root),
+                    "--model-provider",
+                    "http",
+                    "--api-format",
+                    "openai",
+                    "--model-name",
+                    "mini",
+                    "--base-url",
+                    "https://example.test/chat",
+                    "hello",
+                ]
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertIn("provider configuration error", stderr)
+            self.assertIn("API key is required", stderr)
 
     def test_cli_benchmark_command_writes_artifact(self):
         with tempfile.TemporaryDirectory() as temp:

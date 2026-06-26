@@ -59,11 +59,14 @@ class RuntimeTests(unittest.TestCase):
             run_id = agent.session["runs"]["last_run_id"]
             run_dir = root / ".minibot" / "runs" / run_id
             state = self.load_task_state(root, run_id)
+            report = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
             self.assertTrue((run_dir / "task_state.json").exists())
             self.assertTrue((run_dir / "trace.jsonl").exists())
             self.assertTrue((run_dir / "report.json").exists())
             self.assertEqual(state["status"], STATUS_COMPLETED)
             self.assertEqual(state["stop_reason"], STOP_REASON_FINAL_ANSWER_RETURNED)
+            self.assertEqual(report["model"]["model"], "fake")
+            self.assertIn("input_chars", report["model"])
 
     def test_runtime_persists_bounded_session_history_for_tool_call(self):
         with tempfile.TemporaryDirectory() as temp:
