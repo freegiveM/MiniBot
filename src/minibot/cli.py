@@ -30,6 +30,7 @@ from .model_providers import (
     build_model_client_from_config,
     resolve_provider_config,
 )
+from .repl import run_repl
 from .runtime import MiniBot, SessionStore
 from .workspace import WorkspaceContext
 
@@ -40,7 +41,7 @@ MINIBOT_BANNER = r"""MiniBot
  \  ^  /
   `---'
 """
-COMMANDS = frozenset({"benchmark", "metrics"})
+COMMANDS = frozenset({"benchmark", "metrics", "repl"})
 APPROVAL_CHOICES = ("ask", "auto", "deny_risky", "never")
 MODEL_PROVIDER_CHOICES = (PROVIDER_FAKE, PROVIDER_HTTP, PROVIDER_OPENAI, PROVIDER_ANTHROPIC, PROVIDER_DEEPSEEK)
 API_FORMAT_CHOICES = (API_FORMAT_OPENAI, API_FORMAT_ANTHROPIC)
@@ -54,6 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Commands:\n"
             "  minibot \"message\"        Run a single MiniBot task.\n"
+            "  minibot repl             Start an interactive MiniBot REPL.\n"
             "  minibot benchmark         Run the fixed benchmark harness.\n"
             "  minibot metrics           Generate the benchmark core report."
         ),
@@ -115,6 +117,31 @@ def build_metrics_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_repl_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="minibot repl", description="Start an interactive MiniBot REPL.")
+    parser.add_argument("--cwd", default=".", help="Workspace directory.")
+    parser.add_argument("--resume", default=None, help="Resume an existing MiniBot session id.")
+    parser.add_argument(
+        "--approval",
+        choices=APPROVAL_CHOICES,
+        default="ask",
+        help="Approval policy for risky tools.",
+    )
+    parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool steps per REPL turn.")
+    parser.add_argument("--model-provider", choices=MODEL_PROVIDER_CHOICES, default=None, help="Model provider.")
+    parser.add_argument("--api-format", choices=API_FORMAT_CHOICES, default=None, help="HTTP provider wire format.")
+    parser.add_argument("--model-name", default=None, help="Provider model name.")
+    parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
+    parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
+    parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument(
+        "--fake-response",
+        default="<final>MiniBot scaffold is running.</final>",
+        help="Fake model response for smoke runs.",
+    )
+    return parser
+
+
 def build_agent_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="minibot",
@@ -155,6 +182,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_benchmark_command(command_argv)
     if command == "metrics":
         return run_metrics_command(command_argv)
+    if command == "repl":
+        return run_repl_command(command_argv)
     return run_agent_command(argv)
 
 
@@ -271,6 +300,47 @@ def run_metrics_command(argv: list[str]) -> int:
         )
     print(str(report_path))
     return 0
+
+
+def run_repl_command(argv: list[str]) -> int:
+    parser = build_repl_parser()
+    parsed = _parse_or_exit_code(parser, argv)
+    if isinstance(parsed, int):
+        return parsed
+    if parsed.max_steps <= 0:
+        parser.print_usage(sys.stderr)
+        print("minibot: error: --max-steps must be positive", file=sys.stderr)
+        return 2
+
+    cwd = Path(parsed.cwd).resolve()
+    if not cwd.exists() or not cwd.is_dir():
+        print(f"minibot: --cwd does not exist or is not a directory: {cwd}", file=sys.stderr)
+        return 2
+    try:
+        model = build_model_client(
+            cwd=cwd,
+            env_file=parsed.env_file,
+            model_provider=parsed.model_provider,
+            api_format=parsed.api_format,
+            model_name=parsed.model_name,
+            base_url=parsed.base_url,
+            api_key_env=parsed.api_key_env,
+            fake_response=parsed.fake_response,
+        )
+    except ProviderConfigurationError as exc:
+        print(f"minibot: provider configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    return run_repl(
+        cwd=cwd,
+        model_client=model,
+        approval_policy=parsed.approval,
+        max_steps=parsed.max_steps,
+        resume=parsed.resume,
+        input_stream=sys.stdin,
+        output_stream=sys.stdout,
+        error_stream=sys.stderr,
+    )
 
 
 def build_model_client(
