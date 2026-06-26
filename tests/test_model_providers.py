@@ -126,11 +126,12 @@ class ModelProviderTests(unittest.TestCase):
             transport=transport,
         )
 
-        self.assertEqual(client.complete("hello", 32), "<final>openai ok</final>")
+        self.assertEqual(client.complete("hello", 32, temperature=0.2), "<final>openai ok</final>")
         request_payload = json.loads(captured[0].body)
         self.assertEqual(captured[0].headers["Authorization"], "Bearer secret")
         self.assertEqual(request_payload["messages"][0]["content"], "hello")
         self.assertEqual(request_payload["max_tokens"], 32)
+        self.assertEqual(request_payload["temperature"], 0.2)
         self.assertEqual(client.last_completion_metadata["api_format"], API_FORMAT_OPENAI)
         self.assertEqual(client.last_completion_metadata["total_tokens"], 7)
         self.assertTrue(client.last_completion_metadata["api_key_present"])
@@ -165,11 +166,12 @@ class ModelProviderTests(unittest.TestCase):
             transport=transport,
         )
 
-        self.assertEqual(client.complete("hello", 16), "<final>anthropic\nok</final>")
+        self.assertEqual(client.complete("hello", 16, temperature=0.1), "<final>anthropic\nok</final>")
         request_payload = json.loads(captured[0].body)
         self.assertEqual(captured[0].headers["x-api-key"], "secret")
         self.assertIn("anthropic-version", captured[0].headers)
         self.assertEqual(request_payload["messages"][0]["content"], "hello")
+        self.assertEqual(request_payload["temperature"], 0.1)
         self.assertEqual(client.last_completion_metadata["api_format"], API_FORMAT_ANTHROPIC)
         self.assertEqual(client.last_completion_metadata["total_tokens"], 11)
 

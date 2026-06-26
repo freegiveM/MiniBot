@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .evaluator import DEFAULT_ARTIFACT_PATH, DEFAULT_WORKSPACE_ROOT, run_fixed_benchmark
+from .evaluator import DEFAULT_ARTIFACT_PATH, DEFAULT_REAL_ARTIFACT_PATH, DEFAULT_WORKSPACE_ROOT, run_fixed_benchmark
 from .metrics import (
     DEFAULT_CONTEXT_ARTIFACT_PATH,
     DEFAULT_HARNESS_ARTIFACT_PATH,
@@ -79,6 +79,18 @@ def build_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-path", default="benchmarks/coding_tasks.json")
     parser.add_argument("--artifact-path", default=str(DEFAULT_ARTIFACT_PATH))
     parser.add_argument("--workspace-root", default=str(DEFAULT_WORKSPACE_ROOT))
+    parser.add_argument("--real", action="store_true", help="Run a real-model benchmark instead of scripted mock.")
+    parser.add_argument("--model-provider", choices=MODEL_PROVIDER_CHOICES, default=None, help="Model provider.")
+    parser.add_argument("--api-format", choices=API_FORMAT_CHOICES, default=None, help="HTTP provider wire format.")
+    parser.add_argument("--model-name", default=None, help="Provider model name.")
+    parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
+    parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
+    parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Provider decoding temperature.")
+    parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum provider output tokens.")
+    parser.add_argument("--max-tasks", type=int, default=None, help="Limit benchmark tasks.")
+    parser.add_argument("--max-estimated-cost", type=float, default=None, help="Stop after this estimated USD cost.")
+    parser.add_argument("--dry-run", action="store_true", help="Write a planned benchmark artifact without running tasks.")
     return parser
 
 
@@ -190,11 +202,31 @@ def run_benchmark_command(argv: list[str]) -> int:
     if isinstance(parsed, int):
         return parsed
     cwd = Path(parsed.cwd).resolve()
-    artifact = run_fixed_benchmark(
-        benchmark_path=_resolve_cli_path(cwd, parsed.benchmark_path),
-        artifact_path=_resolve_cli_path(cwd, parsed.artifact_path),
-        workspace_root=_resolve_cli_path(cwd, parsed.workspace_root),
-    )
+    real = bool(parsed.real or (parsed.model_provider and parsed.model_provider != PROVIDER_FAKE))
+    artifact_path = parsed.artifact_path
+    if real and artifact_path == str(DEFAULT_ARTIFACT_PATH):
+        artifact_path = str(DEFAULT_REAL_ARTIFACT_PATH)
+    try:
+        artifact = run_fixed_benchmark(
+            benchmark_path=_resolve_cli_path(cwd, parsed.benchmark_path),
+            artifact_path=_resolve_cli_path(cwd, artifact_path),
+            workspace_root=_resolve_cli_path(cwd, parsed.workspace_root),
+            real=real,
+            model_provider=parsed.model_provider,
+            api_format=parsed.api_format,
+            model_name=parsed.model_name,
+            base_url=parsed.base_url,
+            api_key_env=parsed.api_key_env,
+            env_file=_resolve_cli_path(cwd, parsed.env_file),
+            temperature=parsed.temperature,
+            max_new_tokens=parsed.max_new_tokens,
+            max_tasks=parsed.max_tasks,
+            max_estimated_cost=parsed.max_estimated_cost,
+            dry_run=parsed.dry_run,
+        )
+    except ProviderConfigurationError as exc:
+        print(f"minibot: provider configuration error: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(artifact["summary"], sort_keys=True, ensure_ascii=False))
     return 0
 

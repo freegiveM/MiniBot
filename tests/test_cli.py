@@ -112,6 +112,69 @@ class CliTests(unittest.TestCase):
             self.assertGreater(summary["total_tasks"], 0)
             self.assertTrue(artifact_path.exists())
 
+    def test_cli_real_benchmark_reports_configuration_error_without_api_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo_root = Path(__file__).resolve().parents[1]
+
+            code, stdout, stderr = _capture_main(
+                [
+                    "benchmark",
+                    "--cwd",
+                    str(root),
+                    "--benchmark-path",
+                    str(repo_root / "benchmarks" / "coding_tasks.json"),
+                    "--model-provider",
+                    "http",
+                    "--api-format",
+                    "openai",
+                    "--model-name",
+                    "mini",
+                    "--base-url",
+                    "https://example.test/chat",
+                    "--max-tasks",
+                    "1",
+                ]
+            )
+
+            self.assertEqual(code, 2)
+            self.assertEqual(stdout, "")
+            self.assertIn("provider configuration error", stderr)
+            self.assertIn("API key is required", stderr)
+
+    def test_cli_real_benchmark_dry_run_writes_planned_artifact(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repo_root = Path(__file__).resolve().parents[1]
+            artifact_path = root / "harness-real-v1.json"
+
+            code, stdout, stderr = _capture_main(
+                [
+                    "benchmark",
+                    "--cwd",
+                    str(root),
+                    "--benchmark-path",
+                    str(repo_root / "benchmarks" / "coding_tasks.json"),
+                    "--artifact-path",
+                    str(artifact_path),
+                    "--real",
+                    "--dry-run",
+                    "--max-tasks",
+                    "2",
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            summary = json.loads(stdout)
+            self.assertTrue(summary["dry_run"])
+            self.assertEqual(summary["planned_tasks"], 2)
+            self.assertEqual(summary["total_tasks"], 0)
+            saved = json.loads(artifact_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["mode"], "real")
+            self.assertEqual(saved["benchmark"]["selected_task_ids"][0], "docs_update_readme_status")
+            self.assertEqual(saved["benchmark"]["selected_task_ids"][1], "text_replace_priority_label")
+
     def test_cli_metrics_command_writes_report(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
