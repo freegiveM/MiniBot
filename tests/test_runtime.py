@@ -175,7 +175,9 @@ class RuntimeTests(unittest.TestCase):
             (root / "README.md").write_text("demo\n", encoding="utf-8")
             agent = self.build_agent(root, ["<final>Done.</final>"])
             agent.session["history"] = [{"role": "assistant", "content": "old context " + ("x" * 2500)}]
-            agent.context_manager = ContextManager(agent, total_budget=2600)
+            _, raw_metadata = ContextManager(agent, total_budget=None).build_prompt("latest request")
+            budget = raw_metadata["raw_prompt_chars"] - raw_metadata["sections"]["history"]["chars"] + 300
+            agent.context_manager = ContextManager(agent, total_budget=budget)
 
             self.assertEqual(agent.ask("latest request"), "Done.")
 

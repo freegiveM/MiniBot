@@ -172,15 +172,22 @@ class MiniBot:
     def build_prefix(self) -> str:
         tool_lines = []
         for name, spec in sorted(self.tools.items()):
-            tool_lines.append(f"- {name}: {spec.description} args={spec.schema} risky={spec.risky}")
+            args_schema = json.dumps(spec.schema, sort_keys=True, separators=(",", ":"))
+            example_args = json.dumps(spec.example_args, sort_keys=True, separators=(",", ":"))
+            tool_lines.append(
+                f"- {name}: {spec.description} args_schema={args_schema} example_args={example_args} risky={spec.risky}"
+            )
         return "\n".join(
             [
                 "You are MiniBot, a local coding agent.",
                 "Use tools when repository facts are needed.",
                 "For exact source-code facts, read the source file instead of relying on memory.",
                 "Relevant memory is temporary prompt context and must not be treated as session state.",
-                "Respond with <tool>{...}</tool> for tool calls or <final>...</final> for final answers.",
-                "Tools:",
+                'Tool protocol: <tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":40}}</tool>',
+                'Batch tools use <tool>[{"name":"read_file","args":{"path":"README.md"}},{"name":"search","args":{"pattern":"Status","path":"."}}]</tool>; final answers use <final>...</final>.',
+                "Each args object must match that tool's args_schema.",
+                'Do not put tool arguments at the top level; always include both "name" and "args".',
+                "Tools (schemas describe the args object, not the outer tool call):",
                 *tool_lines,
             ]
         )

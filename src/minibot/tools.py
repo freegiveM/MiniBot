@@ -26,6 +26,7 @@ class ToolSpec:
     name: str
     description: str
     schema: dict
+    example_args: dict = field(default_factory=dict)
     risk_level: str = RISK_LEVEL_SAFE
 
     @property
@@ -36,6 +37,7 @@ class ToolSpec:
         return {
             "description": self.description,
             "schema": self.schema,
+            "example_args": self.example_args,
             "risk_level": self.risk_level,
             "risky": self.risky,
         }
@@ -155,51 +157,60 @@ class ToolRegistry:
 BASE_TOOL_SPECS = {
     "list_files": ToolSpec(
         name="list_files",
-        description="List workspace files.",
+        description="List files under a workspace-relative directory before choosing files to inspect.",
         schema={"path": "str='.'"},
+        example_args={"path": "."},
     ),
     "read_file": ToolSpec(
         name="read_file",
-        description="Read a UTF-8 file by line range.",
+        description="Read a UTF-8 workspace file by line range before editing or quoting file contents.",
         schema={"path": "str", "start": "int=1", "end": "int=200"},
+        example_args={"path": "README.md", "start": 1, "end": 40},
     ),
     "search": ToolSpec(
         name="search",
-        description="Search the workspace.",
+        description="Search workspace text for a pattern when locating references or verifying a symbol.",
         schema={"pattern": "str", "path": "str='.'"},
+        example_args={"pattern": "Status", "path": "."},
     ),
     "read_memory": ToolSpec(
         name="read_memory",
-        description="Read bounded long-term memory topics.",
+        description="Read bounded project memory topics for durable user or project preferences.",
         schema={"topic": "str='index'", "max_chars": "int=2000"},
+        example_args={"topic": "index", "max_chars": 1000},
     ),
     "run_shell": ToolSpec(
         name="run_shell",
-        description="Run a shell command.",
+        description="Run a shell command for tests, imports, or diagnostics; include a short timeout.",
         schema={"command": "str", "timeout": "int=20"},
+        example_args={"command": "python -m unittest discover -s tests -v", "timeout": 30},
         risk_level=RISK_LEVEL_RISKY,
     ),
     "write_file": ToolSpec(
         name="write_file",
-        description="Write a text file.",
+        description="Overwrite a text file with complete new content when replacing the whole file is intended.",
         schema={"path": "str", "content": "str"},
+        example_args={"path": "notes.txt", "content": "updated text\n"},
         risk_level=RISK_LEVEL_RISKY,
     ),
     "patch_file": ToolSpec(
         name="patch_file",
-        description="Replace one exact text block.",
+        description="Replace one exact text block in a file after reading it; use for focused edits.",
         schema={"path": "str", "old_text": "str", "new_text": "str"},
+        example_args={"path": "README.md", "old_text": "Status: draft", "new_text": "Status: reviewed"},
         risk_level=RISK_LEVEL_RISKY,
     ),
     "todo_write": ToolSpec(
         name="todo_write",
-        description="Replace the current task plan. Tracks planning only and does not execute tasks.",
+        description="Replace the task plan only; it does not edit files or execute tools.",
         schema={"items_json": "str"},
+        example_args={"items_json": "[{\"id\":\"inspect\",\"text\":\"Read README.md\",\"status\":\"in_progress\"}]"},
     ),
     "delegate": ToolSpec(
         name="delegate",
-        description="Ask a bounded read-only child agent to investigate.",
+        description="Ask a bounded read-only child agent to inspect context and return a concise finding.",
         schema={"task": "str", "allowed_tools": "list=[]", "max_steps": "int=3", "read_only": "bool=True"},
+        example_args={"task": "Inspect README.md for the status line.", "allowed_tools": ["read_file"], "max_steps": 2},
     ),
 }
 
