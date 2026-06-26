@@ -108,6 +108,8 @@ def aggregate_benchmark_artifact(path: str | Path) -> dict[str, Any]:
 
     avg_tool_steps = _average(_number(row.get("tool_steps"), 0.0) for row in rows)
     avg_attempts = _average(_number(row.get("attempts"), 0.0) for row in rows)
+    median_tool_steps = _median(_number(row.get("tool_steps"), 0.0) for row in rows)
+    category_metrics = _category_metrics(rows, summary)
     security = aggregate_tool_boundary_security(artifact)
 
     result: dict[str, Any] = {
@@ -125,9 +127,13 @@ def aggregate_benchmark_artifact(path: str | Path) -> dict[str, Any]:
         "within_budget_rate": within_budget_rate,
         "verifier_pass_rate": verifier_pass_rate,
         "avg_tool_steps": avg_tool_steps,
+        "median_tool_steps": median_tool_steps,
         "avg_attempts": avg_attempts,
+        "category_metrics": category_metrics,
+        "category_pass_rates": {category: item["pass_rate"] for category, item in category_metrics.items()},
         "failure_category_counts": failure_category_counts,
         "failed_examples": _failed_examples(rows),
+        "failure_examples_by_category": _failure_examples_by_category(rows),
         "security": security,
     }
     result.update(
@@ -301,6 +307,8 @@ def _render_report(harness: dict[str, Any], ablations: list[dict[str, Any]]) -> 
         ("within_budget_rate", harness["within_budget_rate"], "row.within_budget"),
         ("verifier_pass_rate", harness["verifier_pass_rate"], "row.verifier_passed"),
         ("avg_tool_steps", harness["avg_tool_steps"], "row.tool_steps"),
+        ("median_tool_steps", harness["median_tool_steps"], "row.tool_steps"),
+        ("category_pass_rates", harness["category_pass_rates"], "row.category + row.passed"),
         ("avg_attempts", harness["avg_attempts"], "row.attempts"),
         ("failure_category_counts", harness["failure_category_counts"], "row.failure_category"),
         ("path_escape_rejection_count", harness["path_escape_rejection_count"], "permission evidence"),
@@ -318,6 +326,30 @@ def _render_report(harness: dict[str, Any], ablations: list[dict[str, Any]]) -> 
             "",
             f"- Risky tool block count: `{security['risky_tool_block_count']}` / `{security['risky_tool_attempt_count']}`.",
             f"- Source limitation: {_md_escape(security['source'])}.",
+            "",
+            "## Category Breakdown",
+            "",
+            "| category | tasks | passed | pass_rate | median_tool_steps |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for category, item in harness["category_metrics"].items():
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    f"`{_md_escape(category)}`",
+                    _format_value(item.get("total_tasks")),
+                    _format_value(item.get("passed")),
+                    _format_value(item.get("pass_rate")),
+                    _format_value(item.get("median_tool_steps")),
+                )
+            )
+            + " |"
+        )
+
+    lines.extend(
+        [
             "",
             "## 适合面试展开的指标",
             "",
@@ -367,6 +399,16 @@ def _render_report(harness: dict[str, Any], ablations: list[dict[str, Any]]) -> 
                 )
     else:
         lines.append("- No failing examples are present in this harness artifact.")
+
+    grouped_examples = harness.get("failure_examples_by_category", {})
+    if grouped_examples:
+        lines.extend(["", "Failure examples by category:", ""])
+        for category, examples in grouped_examples.items():
+            ids = ", ".join(
+                f"`{_md_escape(example.get('id', 'unknown'))}`/{_md_escape(example.get('failure_category', 'unknown'))}"
+                for example in examples
+            )
+            lines.append(f"- `{_md_escape(category)}`: {ids}")
 
     lines.extend(
         [
@@ -437,6 +479,43 @@ def _failure_category_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _category_metrics(rows: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        category = _text(row.get("category"), "uncategorized")
+        grouped.setdefault(category, []).append(row)
+
+    if grouped:
+        metrics = {}
+        for category, items in sorted(grouped.items()):
+            total = len(items)
+            passed = _count_true(items, "passed")
+            metrics[category] = {
+                "total_tasks": total,
+                "passed": passed,
+                "failed": max(total - passed, 0),
+                "pass_rate": _rate(passed, total),
+                "median_tool_steps": _median(_number(row.get("tool_steps"), 0.0) for row in items),
+            }
+        return metrics
+
+    summary_categories = summary.get("category_summary", {}) if isinstance(summary, dict) else {}
+    if isinstance(summary_categories, dict):
+        result = {}
+        for category, payload in sorted(summary_categories.items()):
+            if not isinstance(payload, dict):
+                continue
+            result[str(category)] = {
+                "total_tasks": _int_value(payload.get("total_tasks"), 0),
+                "passed": _int_value(payload.get("passed"), 0),
+                "failed": _int_value(payload.get("failed"), 0),
+                "pass_rate": _float_value(payload.get("pass_rate"), 0.0),
+                "median_tool_steps": _float_value(payload.get("median_tool_steps"), 0.0),
+            }
+        return result
+    return {}
+
+
 def _failed_examples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     examples = []
     for row in rows:
@@ -458,6 +537,14 @@ def _failed_examples(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return examples
+
+
+def _failure_examples_by_category(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for example in _failed_examples(rows):
+        category = example.get("category") or "uncategorized"
+        grouped.setdefault(str(category), []).append(example)
+    return dict(sorted(grouped.items()))
 
 
 def _failure_reason(row: dict[str, Any]) -> str:
@@ -600,6 +687,16 @@ def _average(values) -> float:
     if not items:
         return 0.0
     return sum(float(item) for item in items) / len(items)
+
+
+def _median(values) -> float:
+    items = sorted(float(item or 0.0) for item in values)
+    if not items:
+        return 0.0
+    middle = len(items) // 2
+    if len(items) % 2:
+        return items[middle]
+    return (items[middle - 1] + items[middle]) / 2
 
 
 def _number(value: Any, default: float | None = 0.0) -> float | None:

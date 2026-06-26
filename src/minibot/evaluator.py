@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .context_manager import ContextManager
 from .models import FakeModelClient
 from .runtime import MiniBot, SessionStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
@@ -183,6 +184,7 @@ def _run_task(task: BenchmarkTask, benchmark_root: Path, artifact_root: Path, wo
     )
     agent.tools = _filter_tools(agent.tools, task.allowed_tools)
     agent.prefix = agent.build_prefix()
+    _apply_task_setup(agent, task.setup)
     final_answer = agent.ask(task.prompt)
 
     run_id = agent.session.get("runs", {}).get("last_run_id", "")
@@ -288,6 +290,7 @@ def _summarize_rows(rows: list[dict]) -> dict:
         category = row.get("failure_category") or ""
         if category:
             failures[category] = failures.get(category, 0) + 1
+    category_summary = _category_summary(rows)
     return {
         "total_tasks": total,
         "passed": passed,
@@ -295,8 +298,86 @@ def _summarize_rows(rows: list[dict]) -> dict:
         "pass_rate": _rate(passed, total),
         "within_budget_rate": _rate(within_budget, total),
         "verifier_pass_rate": _rate(verifier_passed, total),
+        "median_tool_steps": _median(row.get("tool_steps", 0) for row in rows),
+        "category_pass_rates": {category: item["pass_rate"] for category, item in category_summary.items()},
+        "category_summary": category_summary,
         "failure_category_counts": failures,
+        "failure_examples_by_category": _failure_examples_by_category(rows),
     }
+
+
+def _apply_task_setup(agent: MiniBot, setup: dict) -> None:
+    if not setup:
+        return
+    kind = str(setup.get("kind", "")).strip()
+    if kind == "context_reduction":
+        history_count = _non_negative_int(setup.get("history_count", 8), "setup.history_count")
+        item_chars = _positive_int(setup.get("item_chars", 500), "setup.item_chars")
+        total_budget = _positive_int(setup.get("total_budget", 2400), "setup.total_budget")
+        latest_marker = str(setup.get("latest_marker", "LATEST_CONTEXT_MARKER_KEEP"))
+        history = []
+        for index in range(history_count):
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": f"older benchmark context {index}: " + ("x" * item_chars),
+                }
+            )
+        history.append({"role": "assistant", "content": latest_marker})
+        agent.session["history"] = history
+        agent.session_path = agent.session_store.save(agent.session)
+        agent.context_manager = ContextManager(agent, total_budget=total_budget)
+        return
+    if kind == "memory_seed":
+        text = str(setup.get("project_memory", "")).strip()
+        if not text:
+            raise ValueError("setup.project_memory must be a non-empty string")
+        memory_root = agent.root / ".minibot" / "memory"
+        memory_root.mkdir(parents=True, exist_ok=True)
+        (memory_root / "MEMORY.md").write_text(text + "\n", encoding="utf-8")
+        return
+    raise ValueError(f"unsupported benchmark setup kind: {kind}")
+
+
+def _category_summary(rows: list[dict]) -> dict[str, dict]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        category = str(row.get("category") or "uncategorized")
+        grouped.setdefault(category, []).append(row)
+
+    summary = {}
+    for category, items in sorted(grouped.items()):
+        total = len(items)
+        passed = sum(1 for row in items if row.get("passed"))
+        summary[category] = {
+            "total_tasks": total,
+            "passed": passed,
+            "failed": total - passed,
+            "pass_rate": _rate(passed, total),
+            "median_tool_steps": _median(row.get("tool_steps", 0) for row in items),
+        }
+    return summary
+
+
+def _failure_examples_by_category(rows: list[dict], limit_per_category: int = 3) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("passed"):
+            continue
+        category = str(row.get("category") or "uncategorized")
+        examples = grouped.setdefault(category, [])
+        if len(examples) >= limit_per_category:
+            continue
+        examples.append(
+            {
+                "id": str(row.get("id") or "unknown"),
+                "failure_category": str(row.get("failure_category") or "unknown"),
+                "stop_reason": str(row.get("stop_reason") or ""),
+                "within_budget": bool(row.get("within_budget")),
+                "verifier_passed": bool(row.get("verifier_passed")),
+            }
+        )
+    return grouped
 
 
 def _failure_category(
@@ -359,6 +440,18 @@ def _positive_int(value: object, key: str) -> int:
     return number
 
 
+def _non_negative_int(value: object, key: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a non-negative integer")
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a non-negative integer") from exc
+    if number < 0:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return number
+
+
 def _string_list(value: object, key: str) -> list[str]:
     if not isinstance(value, list):
         raise ValueError(f"{key} must be a list")
@@ -387,6 +480,16 @@ def _artifact_paths(value: object, key: str) -> list[str]:
 
 def _rate(count: int, total: int) -> float:
     return 0.0 if total == 0 else count / total
+
+
+def _median(values) -> float:
+    items = sorted(float(value or 0) for value in values)
+    if not items:
+        return 0.0
+    middle = len(items) // 2
+    if len(items) % 2:
+        return items[middle]
+    return (items[middle - 1] + items[middle]) / 2
 
 
 def _relpath(path: Path, root: Path) -> str:
