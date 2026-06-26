@@ -8,11 +8,13 @@ from typing import Any
 
 
 DEFAULT_HARNESS_ARTIFACT_PATH = Path("artifacts/harness-regression-v2.json")
+DEFAULT_REAL_HARNESS_ARTIFACT_PATH = Path("artifacts/harness-real-v1.json")
 DEFAULT_CONTEXT_ARTIFACT_PATH = Path("artifacts/context-ablation-v2.json")
 DEFAULT_MEMORY_ARTIFACT_PATH = Path("artifacts/memory-ablation-v2.json")
 DEFAULT_RECOVERY_ARTIFACT_PATH = Path("artifacts/recovery-ablation-v2.json")
 DEFAULT_RETRIEVAL_ARTIFACT_PATH = Path("artifacts/retrieval-ablation-v2.json")
 DEFAULT_REPORT_PATH = Path("artifacts/minibot-benchmark-core-report.md")
+DEFAULT_METHODOLOGY_REPORT_PATH = Path("artifacts/minibot-benchmark-methodology-report.md")
 
 NOT_AVAILABLE = "not_available"
 STATUS_MISSING = "missing"
@@ -111,9 +113,13 @@ def aggregate_benchmark_artifact(path: str | Path) -> dict[str, Any]:
     median_tool_steps = _median(_number(row.get("tool_steps"), 0.0) for row in rows)
     category_metrics = _category_metrics(rows, summary)
     security = aggregate_tool_boundary_security(artifact)
+    failure_category_counts = _failure_category_counts(rows) if rows else _dict_ints(summary.get("failure_category_counts", {}))
+    provider = _provider_summary(rows, artifact, task_count, failure_category_counts)
+    memory_extraction = _memory_extraction_summary(rows)
 
     result: dict[str, Any] = {
         "artifact_path": str(artifact_path),
+        "mode": _text(artifact.get("mode") or _nested_get(artifact, ("reproducibility", "mode"), "unknown")),
         "captured_at": _text(artifact.get("captured_at")),
         "benchmark": artifact.get("benchmark", {}) if isinstance(artifact.get("benchmark"), dict) else {},
         "runtime": artifact.get("runtime", {}) if isinstance(artifact.get("runtime"), dict) else {},
@@ -129,6 +135,14 @@ def aggregate_benchmark_artifact(path: str | Path) -> dict[str, Any]:
         "avg_tool_steps": avg_tool_steps,
         "median_tool_steps": median_tool_steps,
         "avg_attempts": avg_attempts,
+        "provider": provider,
+        "provider_error_rate": provider["provider_error_rate"],
+        "latency_ms_summary": provider["latency_ms_summary"],
+        "estimated_cost_usd_total": provider["estimated_cost_usd_total"],
+        "estimated_cost_usd_avg": provider["estimated_cost_usd_avg"],
+        "memory_extraction": memory_extraction,
+        "mini_llm_schema_error_rate": memory_extraction["mini_llm_schema_error_rate"],
+        "memory_extraction_accept_rate": memory_extraction["memory_extraction_accept_rate"],
         "category_metrics": category_metrics,
         "category_pass_rates": {category: item["pass_rate"] for category, item in category_metrics.items()},
         "failure_category_counts": failure_category_counts,
@@ -175,6 +189,150 @@ def aggregate_tool_boundary_security(artifact: dict[str, Any]) -> dict[str, Any]
         "approval_denied_count": approval_denied,
         "source": "permission evidence embedded in evaluator rows and run reports",
     }
+
+
+def _provider_summary(
+    rows: list[dict[str, Any]],
+    artifact: dict[str, Any],
+    task_count: int,
+    failure_category_counts: dict[str, int],
+) -> dict[str, Any]:
+    reproducibility = artifact.get("reproducibility", {}) if isinstance(artifact.get("reproducibility"), dict) else {}
+    provider_name = _text(reproducibility.get("provider"), NOT_AVAILABLE)
+    model_name = _text(reproducibility.get("model") or reproducibility.get("model_name"), NOT_AVAILABLE)
+    api_format = _text(reproducibility.get("api_format"), NOT_AVAILABLE)
+    row_latencies = [_number(row.get("latency_ms"), None) for row in rows]
+    provider_latencies = [
+        _number(_nested_get(row, ("model_metadata", "latency_ms"), None), None)
+        for row in rows
+        if isinstance(row.get("model_metadata"), dict)
+    ]
+    costs = [_number(row.get("estimated_cost_usd"), None) for row in rows]
+    costs = [value for value in costs if value is not None]
+    for row in rows:
+        metadata = row.get("model_metadata", {}) if isinstance(row.get("model_metadata"), dict) else {}
+        provider_name = _text(metadata.get("provider"), provider_name)
+        model_name = _text(metadata.get("model"), model_name)
+        api_format = _text(metadata.get("api_format"), api_format)
+    return {
+        "provider": provider_name,
+        "model": model_name,
+        "api_format": api_format,
+        "provider_error_count": int(failure_category_counts.get("provider_error", 0)),
+        "provider_error_rate": _rate(int(failure_category_counts.get("provider_error", 0)), task_count),
+        "latency_ms_summary": _numeric_summary(row_latencies),
+        "provider_latency_ms_summary": _numeric_summary(provider_latencies),
+        "estimated_cost_usd_total": sum(float(value) for value in costs) if costs else 0.0,
+        "estimated_cost_usd_avg": _average(costs),
+    }
+
+
+def _memory_extraction_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    extraction_attempts = 0
+    extraction_successes = 0
+    deterministic_fallbacks = 0
+    schema_errors = 0
+    candidate_count = 0
+    accepted_count = 0
+    rejected_count = 0
+    mini_llm_used_count = 0
+
+    for payload in _iter_memory_extraction_payloads(rows):
+        metadata = payload.get("metadata", {}) if isinstance(payload.get("metadata"), dict) else {}
+        extraction_attempts += _int_value(metadata.get("extraction_attempt_count"), 0)
+        extraction_successes += _int_value(metadata.get("extraction_success_count"), 0)
+        deterministic_fallbacks += _int_value(metadata.get("deterministic_fallback_count"), 0)
+        schema_errors += _int_value(metadata.get("schema_error_count"), 0)
+        candidate_count += _int_value(payload.get("candidate_count", metadata.get("candidate_count")), 0)
+        if _is_true(metadata.get("mini_llm_used")):
+            mini_llm_used_count += 1
+        pending_results = payload.get("pending_results", [])
+        if isinstance(pending_results, list):
+            for result in pending_results:
+                if not isinstance(result, dict):
+                    continue
+                if _is_true(result.get("rejected")):
+                    rejected_count += 1
+                if _is_true(result.get("appended")) and not _is_true(result.get("rejected")):
+                    accepted_count += 1
+
+    return {
+        "extraction_attempt_count": extraction_attempts,
+        "extraction_success_count": extraction_successes,
+        "deterministic_fallback_count": deterministic_fallbacks,
+        "schema_error_count": schema_errors,
+        "candidate_count": candidate_count,
+        "accepted_count": accepted_count,
+        "rejected_count": rejected_count,
+        "mini_llm_used_count": mini_llm_used_count,
+        "mini_llm_schema_error_rate": _rate(schema_errors, extraction_attempts),
+        "memory_extraction_accept_rate": _rate(accepted_count, candidate_count),
+    }
+
+
+def _iter_memory_extraction_payloads(rows: list[dict[str, Any]]):
+    for row in rows:
+        report = row.get("report", {}) if isinstance(row.get("report"), dict) else {}
+        hooks = report.get("hooks", {}) if isinstance(report.get("hooks"), dict) else {}
+        emissions = hooks.get("emissions", [])
+        if not isinstance(emissions, list):
+            continue
+        for emission in emissions:
+            if not isinstance(emission, dict):
+                continue
+            outputs = emission.get("outputs", [])
+            if not isinstance(outputs, list):
+                continue
+            for output in outputs:
+                if not isinstance(output, dict):
+                    continue
+                payload = output.get("memory_extraction")
+                if isinstance(payload, dict):
+                    yield payload
+
+
+def summarize_benchmark_artifact(path: str | Path, *, label: str = "") -> dict[str, Any]:
+    artifact_path = Path(path)
+    base = {
+        "label": label or artifact_path.stem,
+        "path": str(artifact_path),
+        "status": STATUS_MISSING,
+        "metrics": {},
+    }
+    if not artifact_path.exists():
+        return base
+    try:
+        return {
+            **base,
+            "status": STATUS_PRESENT,
+            "metrics": aggregate_benchmark_artifact(artifact_path),
+        }
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        return {**base, "status": STATUS_INVALID, "error": str(exc)}
+
+
+def compare_benchmark_artifacts(
+    mock_harness_artifact_path: str | Path = DEFAULT_HARNESS_ARTIFACT_PATH,
+    real_harness_artifact_path: str | Path = DEFAULT_REAL_HARNESS_ARTIFACT_PATH,
+) -> dict[str, Any]:
+    mock = summarize_benchmark_artifact(mock_harness_artifact_path, label="mock")
+    real = summarize_benchmark_artifact(real_harness_artifact_path, label="real")
+    comparison: dict[str, Any] = {}
+    if mock["status"] == STATUS_PRESENT and real["status"] == STATUS_PRESENT:
+        mock_metrics = mock["metrics"]
+        real_metrics = real["metrics"]
+        comparison = {
+            "pass_rate_delta_real_minus_mock": _float_value(real_metrics.get("pass_rate"))
+            - _float_value(mock_metrics.get("pass_rate")),
+            "verifier_pass_rate_delta_real_minus_mock": _float_value(real_metrics.get("verifier_pass_rate"))
+            - _float_value(mock_metrics.get("verifier_pass_rate")),
+            "median_tool_steps_delta_real_minus_mock": _float_value(real_metrics.get("median_tool_steps"))
+            - _float_value(mock_metrics.get("median_tool_steps")),
+            "real_provider_error_rate": _float_value(real_metrics.get("provider_error_rate")),
+            "real_task_count": _int_value(real_metrics.get("task_count")),
+            "mock_task_count": _int_value(mock_metrics.get("task_count")),
+        }
+    return {"mock": mock, "real": real, "comparison": comparison}
 
 
 def summarize_ablation_artifact(path: str | Path, spec: AblationSpec) -> dict[str, Any]:
@@ -253,20 +411,65 @@ def write_benchmark_core_report(
     return report
 
 
+def write_benchmark_methodology_report(
+    report_path: str | Path = DEFAULT_METHODOLOGY_REPORT_PATH,
+    mock_harness_artifact_path: str | Path = DEFAULT_HARNESS_ARTIFACT_PATH,
+    real_harness_artifact_path: str | Path = DEFAULT_REAL_HARNESS_ARTIFACT_PATH,
+    context_artifact_path: str | Path = DEFAULT_CONTEXT_ARTIFACT_PATH,
+    memory_artifact_path: str | Path = DEFAULT_MEMORY_ARTIFACT_PATH,
+    recovery_artifact_path: str | Path = DEFAULT_RECOVERY_ARTIFACT_PATH,
+    retrieval_artifact_path: str | Path = DEFAULT_RETRIEVAL_ARTIFACT_PATH,
+) -> str:
+    benchmark_comparison = compare_benchmark_artifacts(mock_harness_artifact_path, real_harness_artifact_path)
+    ablations = [
+        summarize_ablation_artifact(context_artifact_path, CONTEXT_ABLATION),
+        summarize_ablation_artifact(memory_artifact_path, MEMORY_ABLATION),
+        summarize_ablation_artifact(recovery_artifact_path, RECOVERY_ABLATION),
+        summarize_ablation_artifact(retrieval_artifact_path, RETRIEVAL_ABLATION),
+    ]
+
+    report = _render_methodology_report(benchmark_comparison, ablations)
+    path = Path(report_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(report, encoding="utf-8")
+    temp_path.replace(path)
+    return report
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Aggregate MiniBot benchmark artifacts.")
     parser.add_argument("--harness-artifact-path", default=str(DEFAULT_HARNESS_ARTIFACT_PATH))
+    parser.add_argument("--real-harness-artifact-path", default=str(DEFAULT_REAL_HARNESS_ARTIFACT_PATH))
     parser.add_argument("--context-artifact-path", default=str(DEFAULT_CONTEXT_ARTIFACT_PATH))
     parser.add_argument("--memory-artifact-path", default=str(DEFAULT_MEMORY_ARTIFACT_PATH))
     parser.add_argument("--recovery-artifact-path", default=str(DEFAULT_RECOVERY_ARTIFACT_PATH))
     parser.add_argument("--retrieval-artifact-path", default=str(DEFAULT_RETRIEVAL_ARTIFACT_PATH))
     parser.add_argument("--report-path", default=str(DEFAULT_REPORT_PATH))
     parser.add_argument("--write-core-report", action="store_true")
+    parser.add_argument("--write-methodology-report", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.write_methodology_report:
+        report_path = (
+            DEFAULT_METHODOLOGY_REPORT_PATH
+            if args.report_path == str(DEFAULT_REPORT_PATH)
+            else Path(args.report_path)
+        )
+        write_benchmark_methodology_report(
+            report_path=report_path,
+            mock_harness_artifact_path=args.harness_artifact_path,
+            real_harness_artifact_path=args.real_harness_artifact_path,
+            context_artifact_path=args.context_artifact_path,
+            memory_artifact_path=args.memory_artifact_path,
+            recovery_artifact_path=args.recovery_artifact_path,
+            retrieval_artifact_path=args.retrieval_artifact_path,
+        )
+        print(str(Path(report_path)))
+        return 0
     if args.write_core_report:
         write_benchmark_core_report(
             report_path=args.report_path,
@@ -282,6 +485,252 @@ def main(argv: list[str] | None = None) -> int:
     metrics = aggregate_benchmark_artifact(args.harness_artifact_path)
     print(json.dumps(metrics, indent=2, sort_keys=True, ensure_ascii=False))
     return 0
+
+
+def _render_methodology_report(benchmark_comparison: dict[str, Any], ablations: list[dict[str, Any]]) -> str:
+    mock = benchmark_comparison["mock"]
+    real = benchmark_comparison["real"]
+    comparison = benchmark_comparison.get("comparison", {})
+    lines = [
+        "# MiniBot Benchmark Methodology Report",
+        "",
+        "## Purpose",
+        "",
+        "This report separates harness reliability from real-model behavior. Mock benchmark results are used as regression evidence for fixtures, tools, verifiers, recovery, memory hooks, and metrics. Real benchmark results are opt-in smoke evidence for provider integration and model decision quality.",
+        "",
+        "## Reference Benchmark Ideas",
+        "",
+        "| reference | idea borrowed | MiniBot choice |",
+        "| --- | --- | --- |",
+        "| HumanEval / EvalPlus | executable checks over model self-judgment | verifier scripts, unit tests, and file assertions are the primary pass/fail signal |",
+        "| SWE-bench | patch a repository and judge final state with tests | small fresh fixture copies stand in for heavyweight repositories |",
+        "| AgentBench | record multi-step agent interaction with an environment | MiniBot records local file, shell, permission, memory, trace, and report evidence |",
+        "| GAIA | short tasks can still require tool use and evidence | tasks avoid pure chat and require bounded tool evidence |",
+        "| WebArena / OSWorld | evaluate action traces and final environment state | trace/report/task_state plus verifier output form the evidence chain |",
+        "",
+        "## Artifact Inputs",
+        "",
+        "| artifact | status | path | mode | tasks | captured_at |",
+        "| --- | --- | --- | --- | ---: | --- |",
+        _artifact_source_row(mock),
+        _artifact_source_row(real),
+        "",
+        "## Mock Vs Real Summary",
+        "",
+        "| metric | mock | real | interpretation |",
+        "| --- | ---: | ---: | --- |",
+    ]
+    summary_rows = (
+        ("task_count", "task_count", "how many selected tasks ran"),
+        ("pass_rate", "pass_rate", "end-to-end row.passed rate"),
+        ("verifier_pass_rate", "verifier_pass_rate", "executable verifier success rate"),
+        ("within_budget_rate", "within_budget_rate", "tool step budget adherence"),
+        ("median_tool_steps", "median_tool_steps", "typical tool steps per task"),
+        ("provider_error_rate", "provider_error_rate", "real provider or parser failures"),
+        ("mini_llm_schema_error_rate", "mini_llm_schema_error_rate", "memory miniLLM schema/fallback error rate"),
+        ("memory_extraction_accept_rate", "memory_extraction_accept_rate", "accepted pending memory candidates per candidate"),
+        ("estimated_cost_usd_total", "estimated_cost_usd_total", "reported provider cost, if available"),
+    )
+    for label, key, interpretation in summary_rows:
+        lines.append(
+            f"| `{label}` | {_artifact_metric(mock, key)} | {_artifact_metric(real, key)} | {_md_escape(interpretation)} |"
+        )
+    if comparison:
+        lines.extend(
+            [
+                "",
+                "Comparison deltas are real minus mock:",
+                "",
+                f"- pass_rate delta: `{_format_value(comparison.get('pass_rate_delta_real_minus_mock'))}`",
+                f"- verifier_pass_rate delta: `{_format_value(comparison.get('verifier_pass_rate_delta_real_minus_mock'))}`",
+                f"- median_tool_steps delta: `{_format_value(comparison.get('median_tool_steps_delta_real_minus_mock'))}`",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Category Pass Rates",
+            "",
+            "| category | mock pass_rate | real pass_rate |",
+            "| --- | ---: | ---: |",
+        ]
+    )
+    for category in _combined_categories(mock, real):
+        lines.append(
+            f"| `{_md_escape(category)}` | {_artifact_category_rate(mock, category)} | {_artifact_category_rate(real, category)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Provider, Latency, And Cost",
+            "",
+            "| artifact | provider | model | api_format | provider_error_rate | avg_latency_ms | total_cost_usd |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: |",
+            _provider_row(mock),
+            _provider_row(real),
+            "",
+            "## Memory And miniLLM Subchain",
+            "",
+            "| artifact | mini_llm_used | extraction_attempts | schema_errors | candidates | accepted | schema_error_rate | accept_rate |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            _memory_extraction_row(mock),
+            _memory_extraction_row(real),
+            "",
+            "## Failure Examples",
+            "",
+        ]
+    )
+    lines.extend(_artifact_failure_lines("mock", mock))
+    lines.extend(_artifact_failure_lines("real", real))
+
+    lines.extend(
+        [
+            "",
+            "## Claim Boundaries",
+            "",
+            "### Resume-Safe Metrics",
+            "",
+            "- Number of deterministic fixture tasks and pass rate, when produced by committed mock artifacts.",
+            "- Verifier pass rate, within-budget rate, median tool steps, category pass rates, and failure taxonomy counts.",
+            "- Artifact-backed provider error rate, latency, and cost fields, when the artifact records them.",
+            "",
+            "### Good Interview Discussion Metrics",
+            "",
+            "- Why mock results prove harness and verifier reliability but not real LLM generalization.",
+            "- How real smoke runs validate provider wiring and prompt/tool protocol under cost limits.",
+            "- How memory extraction is evaluated through schema reliability, pending candidates, traceability, and fallback behavior.",
+            "",
+            "### Do Not Overclaim",
+            "",
+            "- Do not compare MiniBot scores to SWE-bench, GAIA, WebArena, or OSWorld as if the scales are equivalent.",
+            "- Do not use a single real run as a general model-quality claim.",
+            "- Do not use LLM self-judgment as the primary pass/fail signal.",
+            "- Do not treat missing artifacts as zero performance; this report marks them as missing/not_available.",
+            "",
+            "## Reproducibility Rules",
+            "",
+            "- Mock runs use scripted deterministic model outputs.",
+            "- Real runs are explicit opt-in and should use low temperature, max task limits, token limits, timeouts, and cost guards.",
+            "- Every task uses a fresh fixture copy; verifiers run inside that copy.",
+            "- Reports should cite artifact paths and preserve failure examples instead of reporting only averages.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _artifact_source_row(summary: dict[str, Any]) -> str:
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    benchmark = metrics.get("benchmark", {}) if isinstance(metrics.get("benchmark"), dict) else {}
+    return (
+        "| "
+        + " | ".join(
+            (
+                f"`{_md_escape(summary.get('label', 'artifact'))}`",
+                f"`{_md_escape(summary.get('status', STATUS_MISSING))}`",
+                f"`{_md_escape(summary.get('path', ''))}`",
+                f"`{_md_escape(metrics.get('mode', NOT_AVAILABLE))}`",
+                _format_value(metrics.get("task_count", NOT_AVAILABLE)),
+                _md_escape(metrics.get("captured_at") or benchmark.get("captured_at") or NOT_AVAILABLE),
+            )
+        )
+        + " |"
+    )
+
+
+def _artifact_metric(summary: dict[str, Any], key: str) -> str:
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    if summary.get("status") != STATUS_PRESENT:
+        return f"`{summary.get('status', STATUS_MISSING)}`"
+    return _format_value(metrics.get(key, NOT_AVAILABLE))
+
+
+def _combined_categories(*summaries: dict[str, Any]) -> list[str]:
+    categories: set[str] = set()
+    for summary in summaries:
+        metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+        category_metrics = metrics.get("category_metrics", {})
+        if isinstance(category_metrics, dict):
+            categories.update(str(category) for category in category_metrics)
+    return sorted(categories)
+
+
+def _artifact_category_rate(summary: dict[str, Any], category: str) -> str:
+    if summary.get("status") != STATUS_PRESENT:
+        return f"`{summary.get('status', STATUS_MISSING)}`"
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    category_metrics = metrics.get("category_metrics", {}) if isinstance(metrics.get("category_metrics"), dict) else {}
+    payload = category_metrics.get(category)
+    if not isinstance(payload, dict):
+        return f"`{NOT_AVAILABLE}`"
+    return _format_value(payload.get("pass_rate", NOT_AVAILABLE))
+
+
+def _provider_row(summary: dict[str, Any]) -> str:
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    provider = metrics.get("provider", {}) if isinstance(metrics.get("provider"), dict) else {}
+    latency = provider.get("latency_ms_summary", {}) if isinstance(provider.get("latency_ms_summary"), dict) else {}
+    return (
+        "| "
+        + " | ".join(
+            (
+                f"`{_md_escape(summary.get('label', 'artifact'))}`",
+                f"`{_md_escape(provider.get('provider', NOT_AVAILABLE))}`",
+                f"`{_md_escape(provider.get('model', NOT_AVAILABLE))}`",
+                f"`{_md_escape(provider.get('api_format', NOT_AVAILABLE))}`",
+                _artifact_metric(summary, "provider_error_rate"),
+                _format_value(latency.get("avg", NOT_AVAILABLE)) if summary.get("status") == STATUS_PRESENT else f"`{summary.get('status', STATUS_MISSING)}`",
+                _artifact_metric(summary, "estimated_cost_usd_total"),
+            )
+        )
+        + " |"
+    )
+
+
+def _memory_extraction_row(summary: dict[str, Any]) -> str:
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    memory = metrics.get("memory_extraction", {}) if isinstance(metrics.get("memory_extraction"), dict) else {}
+    if summary.get("status") != STATUS_PRESENT:
+        status = f"`{summary.get('status', STATUS_MISSING)}`"
+        values = [status] * 7
+    else:
+        values = [
+            _format_value(memory.get("mini_llm_used_count", NOT_AVAILABLE)),
+            _format_value(memory.get("extraction_attempt_count", NOT_AVAILABLE)),
+            _format_value(memory.get("schema_error_count", NOT_AVAILABLE)),
+            _format_value(memory.get("candidate_count", NOT_AVAILABLE)),
+            _format_value(memory.get("accepted_count", NOT_AVAILABLE)),
+            _format_value(memory.get("mini_llm_schema_error_rate", NOT_AVAILABLE)),
+            _format_value(memory.get("memory_extraction_accept_rate", NOT_AVAILABLE)),
+        ]
+    return f"| `{_md_escape(summary.get('label', 'artifact'))}` | " + " | ".join(values) + " |"
+
+
+def _artifact_failure_lines(label: str, summary: dict[str, Any]) -> list[str]:
+    if summary.get("status") != STATUS_PRESENT:
+        return [f"- `{_md_escape(label)}` artifact is `{_md_escape(summary.get('status', STATUS_MISSING))}`."]
+    metrics = summary.get("metrics", {}) if isinstance(summary.get("metrics"), dict) else {}
+    examples = metrics.get("failed_examples", [])
+    if not examples:
+        return [f"- `{_md_escape(label)}`: no failing examples."]
+    lines = [
+        f"### {_md_escape(label)}",
+        "",
+        "| id | category | failure_category | reason | stop_reason |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for example in examples[:8]:
+        lines.append(
+            "| "
+            + " | ".join(
+                _md_escape(_format_value(example.get(key)))
+                for key in ("id", "category", "failure_category", "failure_reason", "stop_reason")
+            )
+            + " |"
+        )
+    return lines
 
 
 def _render_report(harness: dict[str, Any], ablations: list[dict[str, Any]]) -> str:
@@ -697,6 +1146,19 @@ def _median(values) -> float:
     if len(items) % 2:
         return items[middle]
     return (items[middle - 1] + items[middle]) / 2
+
+
+def _numeric_summary(values) -> dict[str, Any]:
+    items = [float(item) for item in values if item is not None]
+    if not items:
+        return {"count": 0, "avg": 0.0, "median": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "count": len(items),
+        "avg": _average(items),
+        "median": _median(items),
+        "min": min(items),
+        "max": max(items),
+    }
 
 
 def _number(value: Any, default: float | None = 0.0) -> float | None:

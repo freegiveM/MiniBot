@@ -9,11 +9,14 @@ from .evaluator import DEFAULT_ARTIFACT_PATH, DEFAULT_REAL_ARTIFACT_PATH, DEFAUL
 from .metrics import (
     DEFAULT_CONTEXT_ARTIFACT_PATH,
     DEFAULT_HARNESS_ARTIFACT_PATH,
+    DEFAULT_METHODOLOGY_REPORT_PATH,
     DEFAULT_MEMORY_ARTIFACT_PATH,
     DEFAULT_RECOVERY_ARTIFACT_PATH,
+    DEFAULT_REAL_HARNESS_ARTIFACT_PATH,
     DEFAULT_REPORT_PATH,
     DEFAULT_RETRIEVAL_ARTIFACT_PATH,
     write_benchmark_core_report,
+    write_benchmark_methodology_report,
 )
 from .model_providers import (
     API_FORMAT_ANTHROPIC,
@@ -98,11 +101,17 @@ def build_metrics_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="minibot metrics", description="Generate MiniBot benchmark reports.")
     parser.add_argument("--cwd", default=".", help="Project root used to resolve relative artifact paths.")
     parser.add_argument("--harness-artifact-path", default=str(DEFAULT_HARNESS_ARTIFACT_PATH))
+    parser.add_argument("--real-harness-artifact-path", default=str(DEFAULT_REAL_HARNESS_ARTIFACT_PATH))
     parser.add_argument("--context-artifact-path", default=str(DEFAULT_CONTEXT_ARTIFACT_PATH))
     parser.add_argument("--memory-artifact-path", default=str(DEFAULT_MEMORY_ARTIFACT_PATH))
     parser.add_argument("--recovery-artifact-path", default=str(DEFAULT_RECOVERY_ARTIFACT_PATH))
     parser.add_argument("--retrieval-artifact-path", default=str(DEFAULT_RETRIEVAL_ARTIFACT_PATH))
     parser.add_argument("--report-path", default=str(DEFAULT_REPORT_PATH))
+    parser.add_argument(
+        "--methodology-report",
+        action="store_true",
+        help=f"Write the Stage 20 methodology report instead of the core report. Default path: {DEFAULT_METHODOLOGY_REPORT_PATH}",
+    )
     return parser
 
 
@@ -237,15 +246,29 @@ def run_metrics_command(argv: list[str]) -> int:
     if isinstance(parsed, int):
         return parsed
     cwd = Path(parsed.cwd).resolve()
-    report_path = _resolve_cli_path(cwd, parsed.report_path)
-    write_benchmark_core_report(
-        report_path=report_path,
-        harness_artifact_path=_resolve_cli_path(cwd, parsed.harness_artifact_path),
-        context_artifact_path=_resolve_cli_path(cwd, parsed.context_artifact_path),
-        memory_artifact_path=_resolve_cli_path(cwd, parsed.memory_artifact_path),
-        recovery_artifact_path=_resolve_cli_path(cwd, parsed.recovery_artifact_path),
-        retrieval_artifact_path=_resolve_cli_path(cwd, parsed.retrieval_artifact_path),
+    report_path = _resolve_cli_path(
+        cwd,
+        str(DEFAULT_METHODOLOGY_REPORT_PATH) if parsed.methodology_report and parsed.report_path == str(DEFAULT_REPORT_PATH) else parsed.report_path,
     )
+    if parsed.methodology_report:
+        write_benchmark_methodology_report(
+            report_path=report_path,
+            mock_harness_artifact_path=_resolve_cli_path(cwd, parsed.harness_artifact_path),
+            real_harness_artifact_path=_resolve_cli_path(cwd, parsed.real_harness_artifact_path),
+            context_artifact_path=_resolve_cli_path(cwd, parsed.context_artifact_path),
+            memory_artifact_path=_resolve_cli_path(cwd, parsed.memory_artifact_path),
+            recovery_artifact_path=_resolve_cli_path(cwd, parsed.recovery_artifact_path),
+            retrieval_artifact_path=_resolve_cli_path(cwd, parsed.retrieval_artifact_path),
+        )
+    else:
+        write_benchmark_core_report(
+            report_path=report_path,
+            harness_artifact_path=_resolve_cli_path(cwd, parsed.harness_artifact_path),
+            context_artifact_path=_resolve_cli_path(cwd, parsed.context_artifact_path),
+            memory_artifact_path=_resolve_cli_path(cwd, parsed.memory_artifact_path),
+            recovery_artifact_path=_resolve_cli_path(cwd, parsed.recovery_artifact_path),
+            retrieval_artifact_path=_resolve_cli_path(cwd, parsed.retrieval_artifact_path),
+        )
     print(str(report_path))
     return 0
 
