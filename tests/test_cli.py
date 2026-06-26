@@ -13,11 +13,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from minibot.cli import main
 
 
-def _capture_main(argv: list[str]) -> tuple[int, str, str]:
+def _capture_main(argv: list[str], stdin_text: str | None = None) -> tuple[int, str, str]:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-        code = main(argv)
+    original_stdin = sys.stdin
+    if stdin_text is not None:
+        sys.stdin = io.StringIO(stdin_text)
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = main(argv)
+    finally:
+        sys.stdin = original_stdin
     return code, stdout.getvalue(), stderr.getvalue()
 
 
@@ -29,6 +35,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn("MiniBot", stdout)
         self.assertIn("/ o o \\", stdout)
+        self.assertIn("minibot repl", stdout)
         self.assertIn("minibot benchmark", stdout)
         self.assertIn("minibot metrics", stdout)
 
@@ -60,6 +67,89 @@ class CliTests(unittest.TestCase):
             run_root = root / ".minibot" / "runs"
             self.assertTrue(run_root.exists())
             self.assertTrue(any(path.name == "report.json" for path in run_root.rglob("report.json")))
+
+    def test_cli_repl_command_runs_two_turn_fake_smoke(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+
+            code, stdout, stderr = _capture_main(
+                [
+                    "repl",
+                    "--cwd",
+                    str(root),
+                    "--approval",
+                    "auto",
+                    "--max-steps",
+                    "2",
+                    "--model-provider",
+                    "fake",
+                    "--fake-response",
+                    "<final>CLI REPL first.</final>",
+                ],
+                stdin_text="first\nsecond\n/exit\n",
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("MiniBot REPL", stdout)
+            self.assertIn("CLI REPL first.", stdout)
+            self.assertIn("Done.", stdout)
+            self.assertIn("Bye.", stdout)
+            run_reports = list((root / ".minibot" / "runs").glob("*/report.json"))
+            self.assertEqual(len(run_reports), 2)
+            sessions = list((root / ".minibot" / "sessions").glob("*.json"))
+            self.assertEqual(len(sessions), 1)
+            saved = json.loads(sessions[0].read_text(encoding="utf-8"))
+            self.assertEqual(saved["turn_count"], 2)
+
+    def test_cli_repl_command_resumes_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+
+            first_code, _, first_stderr = _capture_main(
+                [
+                    "repl",
+                    "--cwd",
+                    str(root),
+                    "--approval",
+                    "auto",
+                    "--model-provider",
+                    "fake",
+                    "--fake-response",
+                    "<final>First.</final>",
+                ],
+                stdin_text="first\n/exit\n",
+            )
+            session_id = next((root / ".minibot" / "sessions").glob("*.json")).stem
+
+            second_code, stdout, second_stderr = _capture_main(
+                [
+                    "repl",
+                    "--cwd",
+                    str(root),
+                    "--resume",
+                    session_id,
+                    "--approval",
+                    "auto",
+                    "--model-provider",
+                    "fake",
+                    "--fake-response",
+                    "<final>Second.</final>",
+                ],
+                stdin_text="second\n/exit\n",
+            )
+
+            self.assertEqual(first_code, 0)
+            self.assertEqual(second_code, 0)
+            self.assertEqual(first_stderr, "")
+            self.assertEqual(second_stderr, "")
+            self.assertIn(session_id, stdout)
+            sessions = list((root / ".minibot" / "sessions").glob("*.json"))
+            self.assertEqual(len(sessions), 1)
+            saved = json.loads(sessions[0].read_text(encoding="utf-8"))
+            self.assertEqual(saved["turn_count"], 2)
 
     def test_cli_http_provider_reports_configuration_error_without_api_key(self):
         with tempfile.TemporaryDirectory() as temp:
