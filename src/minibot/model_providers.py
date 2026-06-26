@@ -108,9 +108,9 @@ class HTTPModelClient:
         self.last_completion_metadata: dict = {}
 
     def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
-        del kwargs
         started = time.perf_counter()
-        request = self._build_request(prompt, max_new_tokens)
+        temperature = kwargs.get("temperature")
+        request = self._build_request(prompt, max_new_tokens, temperature=temperature)
         try:
             response = self.transport(request)
             latency_ms = int((time.perf_counter() - started) * 1000)
@@ -143,19 +143,21 @@ class HTTPModelClient:
             }
             raise
 
-    def _build_request(self, prompt: str, max_new_tokens: int) -> HTTPRequest:
+    def _build_request(self, prompt: str, max_new_tokens: int, *, temperature=None) -> HTTPRequest:
         if self.config.api_format == API_FORMAT_OPENAI:
-            return self._build_openai_request(prompt, max_new_tokens)
+            return self._build_openai_request(prompt, max_new_tokens, temperature=temperature)
         if self.config.api_format == API_FORMAT_ANTHROPIC:
-            return self._build_anthropic_request(prompt, max_new_tokens)
+            return self._build_anthropic_request(prompt, max_new_tokens, temperature=temperature)
         raise ProviderConfigurationError(f"unsupported api_format: {self.config.api_format}")
 
-    def _build_openai_request(self, prompt: str, max_new_tokens: int) -> HTTPRequest:
+    def _build_openai_request(self, prompt: str, max_new_tokens: int, *, temperature=None) -> HTTPRequest:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": int(max_new_tokens),
         }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
         return HTTPRequest(
             url=self.config.base_url,
             headers={
@@ -166,12 +168,14 @@ class HTTPModelClient:
             timeout=self.config.timeout_seconds,
         )
 
-    def _build_anthropic_request(self, prompt: str, max_new_tokens: int) -> HTTPRequest:
+    def _build_anthropic_request(self, prompt: str, max_new_tokens: int, *, temperature=None) -> HTTPRequest:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": int(max_new_tokens),
         }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
         return HTTPRequest(
             url=self.config.base_url,
             headers={

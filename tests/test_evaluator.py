@@ -8,7 +8,25 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from minibot.evaluator import load_benchmark, run_fixed_benchmark
+from minibot.evaluator import FAILURE_PROVIDER_ERROR, MODE_REAL, load_benchmark, run_fixed_benchmark
+from minibot.models import FakeModelClient
+
+
+class FailingProviderModel:
+    supports_prompt_cache = False
+    model = "failing-real"
+
+    def __init__(self):
+        self.last_completion_metadata = {}
+
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+        del prompt, max_new_tokens, kwargs
+        self.last_completion_metadata = {
+            "provider": "http",
+            "model": self.model,
+            "error_category": "provider_network_error",
+        }
+        raise RuntimeError("provider unavailable")
 
 
 class EvaluatorTests(unittest.TestCase):
@@ -78,6 +96,54 @@ class EvaluatorTests(unittest.TestCase):
                 with self.subTest(index=index):
                     with self.assertRaises(ValueError):
                         load_benchmark(benchmark_path)
+
+    def test_real_benchmark_mode_uses_injected_model_and_separate_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            benchmark_path = Path(__file__).resolve().parents[1] / "benchmarks" / "coding_tasks.json"
+            artifact_path = root / "harness-real-v1.json"
+
+            artifact = run_fixed_benchmark(
+                benchmark_path=benchmark_path,
+                artifact_path=artifact_path,
+                workspace_root=root / "real-workspaces",
+                real=True,
+                max_tasks=1,
+                temperature=0.2,
+                max_new_tokens=128,
+                model_client_factory=lambda task: FakeModelClient(list(task.model_outputs), model="stub-real"),
+            )
+
+            self.assertEqual(artifact["mode"], MODE_REAL)
+            self.assertEqual(artifact["benchmark"]["task_count"], 1)
+            self.assertEqual(artifact["benchmark"]["source_task_count"], 12)
+            self.assertEqual(artifact["summary"]["passed"], 1)
+            self.assertEqual(artifact["reproducibility"]["model_version"], "injected-test-double")
+            self.assertEqual(artifact["reproducibility"]["decoding"]["temperature"], 0.2)
+            self.assertEqual(artifact["reproducibility"]["decoding"]["max_new_tokens"], 128)
+            self.assertEqual(artifact["rows"][0]["mode"], MODE_REAL)
+            self.assertEqual(artifact["rows"][0]["model_metadata"]["model"], "stub-real")
+            self.assertTrue(artifact_path.exists())
+
+    def test_real_benchmark_provider_error_gets_failure_category(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            benchmark_path = Path(__file__).resolve().parents[1] / "benchmarks" / "coding_tasks.json"
+
+            artifact = run_fixed_benchmark(
+                benchmark_path=benchmark_path,
+                artifact_path=root / "harness-real-v1.json",
+                workspace_root=root / "real-workspaces",
+                real=True,
+                max_tasks=1,
+                model_client_factory=lambda task: FailingProviderModel(),
+            )
+
+            self.assertEqual(artifact["summary"]["failed"], 1)
+            self.assertEqual(artifact["summary"]["failure_category_counts"], {FAILURE_PROVIDER_ERROR: 1})
+            self.assertEqual(artifact["rows"][0]["failure_category"], FAILURE_PROVIDER_ERROR)
+            self.assertEqual(artifact["rows"][0]["stop_reason"], "model_error")
+            self.assertEqual(artifact["rows"][0]["model_metadata"]["error_category"], "provider_network_error")
 
 
 if __name__ == "__main__":

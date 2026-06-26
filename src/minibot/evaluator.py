@@ -6,21 +6,29 @@ import json
 import locale
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from .context_manager import ContextManager
 from .models import FakeModelClient
+from .model_providers import ProviderConfig, build_model_client_from_config, resolve_provider_config
 from .runtime import MiniBot, SessionStore
-from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED
+from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED, STOP_REASON_MODEL_ERROR, STOP_REASON_TOOL_ERROR
 from .tools import ToolRegistry
 from .workspace import WorkspaceContext
 
 
 SCHEMA_VERSION = 1
 DEFAULT_ARTIFACT_PATH = Path("artifacts/harness-regression-v2.json")
+DEFAULT_REAL_ARTIFACT_PATH = Path("artifacts/harness-real-v1.json")
 DEFAULT_WORKSPACE_ROOT = Path("artifacts/evaluator-workspaces")
+REAL_DEFAULT_MAX_TASKS = 5
+REAL_SMOKE_CATEGORY_ORDER = ("documentation", "text-edit", "code-modification", "tool-boundary", "memory")
+MODE_MOCK = "mock"
+MODE_REAL = "real"
 REQUIRED_TASK_FIELDS = (
     "id",
     "prompt",
@@ -35,7 +43,11 @@ FAILURE_MISSING_ARTIFACT = "missing_artifact"
 FAILURE_BUDGET_EXCEEDED = "budget_exceeded"
 FAILURE_VERIFIER_FAILED = "verifier_failed"
 FAILURE_STOP_REASON = "failure_stop_reason"
+FAILURE_PROVIDER_ERROR = "provider_error"
+FAILURE_TOOL_ERROR = "tool_error"
 FAILURE_UNKNOWN = "unknown"
+
+ModelClientFactory = Callable[["BenchmarkTask"], object]
 
 
 @dataclass(frozen=True)
@@ -106,6 +118,18 @@ class Benchmark:
     path: Path
 
 
+@dataclass(frozen=True)
+class BenchmarkRunConfig:
+    mode: str = MODE_MOCK
+    max_new_tokens: int = 512
+    temperature: float = 0.0
+    max_tasks: int | None = None
+    max_estimated_cost: float | None = None
+    dry_run: bool = False
+    provider_config: ProviderConfig | None = None
+    model_client_factory: ModelClientFactory | None = None
+
+
 def load_benchmark(path: str | Path) -> Benchmark:
     benchmark_path = Path(path).resolve()
     payload = json.loads(benchmark_path.read_text(encoding="utf-8"))
@@ -133,46 +157,86 @@ def run_fixed_benchmark(
     benchmark_path: str | Path = "benchmarks/coding_tasks.json",
     artifact_path: str | Path = DEFAULT_ARTIFACT_PATH,
     workspace_root: str | Path = DEFAULT_WORKSPACE_ROOT,
+    *,
+    real: bool = False,
+    model_provider: str | None = None,
+    api_format: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
+    env_file: str | Path = ".env",
+    temperature: float = 0.0,
+    max_new_tokens: int = 512,
+    max_tasks: int | None = None,
+    max_estimated_cost: float | None = None,
+    dry_run: bool = False,
+    model_client_factory: ModelClientFactory | None = None,
 ) -> dict:
     benchmark = load_benchmark(benchmark_path)
     artifact_path = Path(artifact_path).resolve()
     workspace_root = Path(workspace_root).resolve()
     workspace_root.mkdir(parents=True, exist_ok=True)
+    config = _benchmark_run_config(
+        benchmark_path=benchmark.path,
+        real=real,
+        model_provider=model_provider,
+        api_format=api_format,
+        model_name=model_name,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        env_file=env_file,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        max_tasks=max_tasks,
+        max_estimated_cost=max_estimated_cost,
+        dry_run=dry_run,
+        model_client_factory=model_client_factory,
+    )
+    tasks = _selected_tasks(benchmark.tasks, config)
     rows = []
-    for task in benchmark.tasks:
-        rows.append(_run_task(task, benchmark.path.parent, artifact_path.parent, workspace_root))
+    estimated_cost_total = 0.0
+    if not config.dry_run:
+        for task in tasks:
+            if config.max_estimated_cost is not None and estimated_cost_total >= config.max_estimated_cost:
+                break
+            row = _run_task(task, benchmark.path.parent, artifact_path.parent, workspace_root, config)
+            rows.append(row)
+            estimated_cost_total += float(row.get("estimated_cost_usd", 0.0) or 0.0)
     artifact = {
         "schema_version": SCHEMA_VERSION,
+        "mode": config.mode,
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "benchmark": {
             "path": _relpath(benchmark.path, artifact_path.parent),
             "description": benchmark.description,
-            "task_count": len(benchmark.tasks),
+            "task_count": len(tasks),
+            "source_task_count": len(benchmark.tasks),
+            "selected_task_ids": [task.id for task in tasks],
         },
         "runtime": _runtime_metadata(),
-        "reproducibility": {
-            "fixture_snapshot_id": _benchmark_snapshot_id(benchmark.path.parent, benchmark.tasks),
-            "model_name": "FakeModelClient",
-            "model_version": "scripted-deterministic",
-            "decoding": {"temperature": 0.0, "top_p": 1.0, "max_new_tokens": 512},
-            "timezone": datetime.now(timezone.utc).astimezone().tzname() or "UTC",
-            "locale": locale.setlocale(locale.LC_CTYPE, None),
-        },
-        "summary": _summarize_rows(rows),
+        "reproducibility": _reproducibility_metadata(benchmark.path.parent, tasks, config),
+        "summary": _summarize_rows(rows, planned_total=len(tasks), dry_run=config.dry_run),
         "rows": rows,
     }
     _write_json_atomic(artifact_path, artifact)
     return artifact
 
 
-def _run_task(task: BenchmarkTask, benchmark_root: Path, artifact_root: Path, workspace_root: Path) -> dict:
+def _run_task(
+    task: BenchmarkTask,
+    benchmark_root: Path,
+    artifact_root: Path,
+    workspace_root: Path,
+    config: BenchmarkRunConfig,
+) -> dict:
     fixture_source = (benchmark_root / task.fixture_repo).resolve()
     fixture_copy = workspace_root / _safe_task_dir(task.id)
     if fixture_copy.exists():
         shutil.rmtree(fixture_copy)
     shutil.copytree(fixture_source, fixture_copy)
 
-    model = FakeModelClient(list(task.model_outputs), model="fake-scripted")
+    model = _model_client_for_task(task, config)
+    model = _DecodingModelClient(model, temperature=config.temperature)
     workspace = WorkspaceContext.build(fixture_copy, repo_root_override=fixture_copy)
     agent = MiniBot(
         model_client=model,
@@ -180,18 +244,21 @@ def _run_task(task: BenchmarkTask, benchmark_root: Path, artifact_root: Path, wo
         session_store=SessionStore(fixture_copy / ".minibot" / "sessions"),
         approval_policy="auto",
         max_steps=task.step_budget,
-        max_new_tokens=512,
+        max_new_tokens=config.max_new_tokens,
     )
     agent.tools = _filter_tools(agent.tools, task.allowed_tools)
     agent.prefix = agent.build_prefix()
     _apply_task_setup(agent, task.setup)
+    started = time.perf_counter()
     final_answer = agent.ask(task.prompt)
+    latency_ms = int((time.perf_counter() - started) * 1000)
 
     run_id = agent.session.get("runs", {}).get("last_run_id", "")
     report_path = fixture_copy / ".minibot" / "runs" / run_id / "report.json"
     trace_path = fixture_copy / ".minibot" / "runs" / run_id / "trace.jsonl"
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.exists() else {}
     task_state = report.get("task_state", {})
+    model_metadata = report.get("model", {}) if isinstance(report.get("model"), dict) else {}
     verifier_result = _run_verifier(task.verifier, fixture_copy)
     expected_artifact_exists = all((fixture_copy / path).exists() for path in task.expected_artifact)
     tool_steps = int(task_state.get("tool_steps", 0) or 0)
@@ -209,9 +276,11 @@ def _run_task(task: BenchmarkTask, benchmark_root: Path, artifact_root: Path, wo
         within_budget=within_budget,
         verifier_passed=verifier_result["passed"],
         stop_reason=stop_reason,
+        model_metadata=model_metadata,
     )
     return {
         "id": task.id,
+        "mode": config.mode,
         "prompt": task.prompt,
         "category": task.category,
         "allowed_tools": list(task.allowed_tools),
@@ -235,6 +304,9 @@ def _run_task(task: BenchmarkTask, benchmark_root: Path, artifact_root: Path, wo
         "passed": passed,
         "failure_category": failure_category,
         "final_answer": final_answer,
+        "latency_ms": latency_ms,
+        "model_metadata": model_metadata,
+        "estimated_cost_usd": _estimated_cost_usd(model_metadata),
         "report": {
             "task_state": task_state,
             "prompt_metadata": report.get("prompt_metadata", {}),
@@ -253,6 +325,162 @@ def _filter_tools(registry: ToolRegistry, allowed_tools: tuple[str, ...]) -> Too
             raise ValueError(f"allowed tool is unavailable: {name}")
         filtered.register(specs[name], handlers[name])
     return filtered
+
+
+class _DecodingModelClient:
+    def __init__(self, inner, *, temperature: float):
+        self.inner = inner
+        self.temperature = float(temperature)
+        self.supports_prompt_cache = bool(getattr(inner, "supports_prompt_cache", False))
+        self.model = str(getattr(inner, "model", "") or getattr(getattr(inner, "config", None), "model_name", ""))
+
+    @property
+    def last_completion_metadata(self) -> dict:
+        metadata = getattr(self.inner, "last_completion_metadata", {})
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+        kwargs.setdefault("temperature", self.temperature)
+        return self.inner.complete(prompt, max_new_tokens, **kwargs)
+
+
+def _benchmark_run_config(
+    *,
+    benchmark_path: Path,
+    real: bool,
+    model_provider: str | None,
+    api_format: str | None,
+    model_name: str | None,
+    base_url: str | None,
+    api_key_env: str | None,
+    env_file: str | Path,
+    temperature: float,
+    max_new_tokens: int,
+    max_tasks: int | None,
+    max_estimated_cost: float | None,
+    dry_run: bool,
+    model_client_factory: ModelClientFactory | None,
+) -> BenchmarkRunConfig:
+    mode = MODE_REAL if real or _real_provider_requested(model_provider) else MODE_MOCK
+    max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
+    temperature = _float_arg(temperature, "temperature")
+    normalized_max_tasks = _optional_positive_int(max_tasks, "max_tasks")
+    normalized_max_cost = _optional_non_negative_float(max_estimated_cost, "max_estimated_cost")
+    provider_config = None
+    if mode == MODE_REAL and model_client_factory is None and not dry_run:
+        provider_config = resolve_provider_config(
+            cwd=Path.cwd(),
+            env_file=env_file,
+            model_provider=model_provider,
+            api_format=api_format,
+            model_name=model_name,
+            base_url=base_url,
+            api_key_env=api_key_env,
+        )
+    elif mode == MODE_REAL and model_client_factory is None and dry_run and model_provider:
+        provider_config = _dry_run_provider_config(
+            benchmark_path=benchmark_path,
+            env_file=env_file,
+            model_provider=model_provider,
+            api_format=api_format,
+            model_name=model_name,
+            base_url=base_url,
+            api_key_env=api_key_env,
+        )
+    return BenchmarkRunConfig(
+        mode=mode,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        max_tasks=normalized_max_tasks,
+        max_estimated_cost=normalized_max_cost,
+        dry_run=bool(dry_run),
+        provider_config=provider_config,
+        model_client_factory=model_client_factory,
+    )
+
+
+def _dry_run_provider_config(
+    *,
+    benchmark_path: Path,
+    env_file: str | Path,
+    model_provider: str | None,
+    api_format: str | None,
+    model_name: str | None,
+    base_url: str | None,
+    api_key_env: str | None,
+) -> ProviderConfig | None:
+    try:
+        return resolve_provider_config(
+            cwd=Path.cwd(),
+            env_file=env_file,
+            model_provider=model_provider,
+            api_format=api_format,
+            model_name=model_name,
+            base_url=base_url,
+            api_key_env=api_key_env,
+        )
+    except Exception:
+        return None
+
+
+def _selected_tasks(tasks: tuple[BenchmarkTask, ...], config: BenchmarkRunConfig) -> tuple[BenchmarkTask, ...]:
+    ordered_tasks = _real_smoke_order(tasks) if config.mode == MODE_REAL else tasks
+    limit = config.max_tasks
+    if limit is None and config.mode == MODE_REAL:
+        limit = REAL_DEFAULT_MAX_TASKS
+    if limit is None:
+        return ordered_tasks
+    return tuple(ordered_tasks[:limit])
+
+
+def _real_smoke_order(tasks: tuple[BenchmarkTask, ...]) -> tuple[BenchmarkTask, ...]:
+    selected: list[BenchmarkTask] = []
+    selected_ids: set[str] = set()
+    for category in REAL_SMOKE_CATEGORY_ORDER:
+        task = next((item for item in tasks if item.category == category and item.id not in selected_ids), None)
+        if task is None:
+            continue
+        selected.append(task)
+        selected_ids.add(task.id)
+    for task in tasks:
+        if task.id not in selected_ids:
+            selected.append(task)
+            selected_ids.add(task.id)
+    return tuple(selected)
+
+
+def _model_client_for_task(task: BenchmarkTask, config: BenchmarkRunConfig):
+    if config.model_client_factory is not None:
+        return config.model_client_factory(task)
+    if config.mode == MODE_REAL:
+        if config.provider_config is None:
+            raise ValueError("real benchmark requires a provider config or model_client_factory")
+        return build_model_client_from_config(config.provider_config)
+    return FakeModelClient(list(task.model_outputs), model="fake-scripted")
+
+
+def _reproducibility_metadata(root: Path, tasks: tuple[BenchmarkTask, ...], config: BenchmarkRunConfig) -> dict:
+    metadata = {
+        "fixture_snapshot_id": _benchmark_snapshot_id(root, tasks),
+        "mode": config.mode,
+        "decoding": {"temperature": config.temperature, "top_p": 1.0, "max_new_tokens": config.max_new_tokens},
+        "timezone": datetime.now(timezone.utc).astimezone().tzname() or "UTC",
+        "locale": locale.setlocale(locale.LC_CTYPE, None),
+        "dry_run": config.dry_run,
+    }
+    if config.mode == MODE_MOCK:
+        metadata.update({"model_name": "FakeModelClient", "model_version": "scripted-deterministic"})
+    elif config.provider_config is not None:
+        metadata.update(config.provider_config.safe_metadata())
+        metadata["model_name"] = config.provider_config.model_name
+        metadata["model_version"] = "real-provider"
+    else:
+        metadata.update({"provider": "injected", "model_name": "injected", "model_version": "injected-test-double"})
+    return metadata
+
+
+def _real_provider_requested(model_provider: str | None) -> bool:
+    return bool(model_provider and str(model_provider).strip().lower() != "fake")
 
 
 def _run_verifier(command: str, cwd: Path) -> dict:
@@ -280,8 +508,9 @@ def _run_verifier(command: str, cwd: Path) -> dict:
         }
 
 
-def _summarize_rows(rows: list[dict]) -> dict:
+def _summarize_rows(rows: list[dict], planned_total: int | None = None, dry_run: bool = False) -> dict:
     total = len(rows)
+    planned_total = total if planned_total is None else int(planned_total)
     passed = sum(1 for row in rows if row.get("passed"))
     within_budget = sum(1 for row in rows if row.get("within_budget"))
     verifier_passed = sum(1 for row in rows if row.get("verifier_passed"))
@@ -293,8 +522,10 @@ def _summarize_rows(rows: list[dict]) -> dict:
     category_summary = _category_summary(rows)
     return {
         "total_tasks": total,
+        "planned_tasks": planned_total,
         "passed": passed,
         "failed": total - passed,
+        "dry_run": bool(dry_run),
         "pass_rate": _rate(passed, total),
         "within_budget_rate": _rate(within_budget, total),
         "verifier_pass_rate": _rate(verifier_passed, total),
@@ -386,11 +617,17 @@ def _failure_category(
     within_budget: bool,
     verifier_passed: bool,
     stop_reason: str,
+    model_metadata: dict | None = None,
 ) -> str:
+    model_metadata = model_metadata if isinstance(model_metadata, dict) else {}
+    if model_metadata.get("error_category") or stop_reason == STOP_REASON_MODEL_ERROR:
+        return FAILURE_PROVIDER_ERROR
     if not expected_artifact_exists:
         return FAILURE_MISSING_ARTIFACT
     if not within_budget:
         return FAILURE_BUDGET_EXCEEDED
+    if stop_reason == STOP_REASON_TOOL_ERROR:
+        return FAILURE_TOOL_ERROR
     if not verifier_passed:
         return FAILURE_VERIFIER_FAILED
     if stop_reason != STOP_REASON_FINAL_ANSWER_RETURNED:
@@ -440,6 +677,12 @@ def _positive_int(value: object, key: str) -> int:
     return number
 
 
+def _optional_positive_int(value: object, key: str) -> int | None:
+    if value in (None, ""):
+        return None
+    return _positive_int(value, key)
+
+
 def _non_negative_int(value: object, key: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{key} must be a non-negative integer")
@@ -450,6 +693,31 @@ def _non_negative_int(value: object, key: str) -> int:
     if number < 0:
         raise ValueError(f"{key} must be a non-negative integer")
     return number
+
+
+def _float_arg(value: object, key: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a number") from exc
+
+
+def _optional_non_negative_float(value: object, key: str) -> float | None:
+    if value in (None, ""):
+        return None
+    number = _float_arg(value, key)
+    if number < 0:
+        raise ValueError(f"{key} must be non-negative")
+    return number
+
+
+def _estimated_cost_usd(model_metadata: dict) -> float:
+    try:
+        return float(model_metadata.get("estimated_cost_usd", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _string_list(value: object, key: str) -> list[str]:
@@ -526,6 +794,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--benchmark-path", default="benchmarks/coding_tasks.json")
     parser.add_argument("--artifact-path", default=str(DEFAULT_ARTIFACT_PATH))
     parser.add_argument("--workspace-root", default=str(DEFAULT_WORKSPACE_ROOT))
+    parser.add_argument("--real", action="store_true", help="Run benchmark with a real model provider.")
+    parser.add_argument("--model-provider", default=None, help="Provider name for real benchmark mode.")
+    parser.add_argument("--api-format", default=None, help="Provider API format.")
+    parser.add_argument("--model-name", default=None, help="Provider model name.")
+    parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
+    parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
+    parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-tasks", type=int, default=None)
+    parser.add_argument("--max-estimated-cost", type=float, default=None)
+    parser.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -535,6 +815,18 @@ def main(argv: list[str] | None = None) -> int:
         benchmark_path=args.benchmark_path,
         artifact_path=args.artifact_path,
         workspace_root=args.workspace_root,
+        real=args.real,
+        model_provider=args.model_provider,
+        api_format=args.api_format,
+        model_name=args.model_name,
+        base_url=args.base_url,
+        api_key_env=args.api_key_env,
+        env_file=args.env_file,
+        temperature=args.temperature,
+        max_new_tokens=args.max_new_tokens,
+        max_tasks=args.max_tasks,
+        max_estimated_cost=args.max_estimated_cost,
+        dry_run=args.dry_run,
     )
     print(json.dumps(artifact["summary"], sort_keys=True, ensure_ascii=False))
     return 0
