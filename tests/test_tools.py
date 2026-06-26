@@ -63,7 +63,7 @@ class ToolRegistryTests(unittest.TestCase):
     def test_tool_registry_custom_tool_uses_schema_and_observation(self):
         registry = ToolRegistry()
         registry.register(
-            ToolSpec(name="echo", description="Echo text.", schema={"text": "str"}),
+            ToolSpec(name="echo", description="Echo text.", schema={"text": "str"}, example_args={"text": "hello"}),
             lambda runtime_context, args: "echo:" + args["text"],
         )
 
@@ -71,6 +71,7 @@ class ToolRegistryTests(unittest.TestCase):
 
         self.assertEqual(observation.status, OBSERVATION_SUCCEEDED)
         self.assertEqual(observation.content, "echo:hello")
+        self.assertEqual(registry.prompt_specs()["echo"]["example_args"], {"text": "hello"})
         with self.assertRaises(ValueError):
             registry.dispatch("echo", {}, runtime_context=None)
 

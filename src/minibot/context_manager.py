@@ -295,7 +295,9 @@ class ContextManager:
                 "- role: local coding agent",
                 "- source_fact_policy: use tools for repository facts; reread source files for exact code facts",
                 "- relevant_memory_policy: relevant memory is temporary prompt context, not session state",
-                "- response_contract: use <tool>{...}</tool> or <tool>[...]</tool> for tool calls; use <final>...</final> for final answers",
+                '- response_contract: <tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":40}}</tool> or <final>...</final>',
+                '- tool_batch_example: <tool>[{"name":"read_file","args":{"path":"README.md"}},{"name":"search","args":{"pattern":"Status","path":"."}}]</tool>',
+                '- tool_call_policy: every call needs "name" and "args"; args must match args_schema and must not be top-level',
             ]
         )
 
@@ -303,7 +305,7 @@ class ContextManager:
         return self.agent.workspace.text()
 
     def _render_tools(self) -> str:
-        lines = ["Tools:"]
+        lines = ["Tools:", "- schema_note: schemas describe the args object, not the outer tool call"]
         specs = self.agent.tools.prompt_specs()
         if not specs:
             lines.append("- none")
@@ -312,7 +314,8 @@ class ContextManager:
             lines.append(
                 "- "
                 + f"{name}: {spec.get('description', '')} "
-                + f"schema={self._json_for_prompt(spec.get('schema', {}))} "
+                + f"args_schema={self._json_for_prompt(spec.get('schema', {}))} "
+                + f"example_args={self._json_for_prompt(spec.get('example_args', {}))} "
                 + f"risk_level={spec.get('risk_level', '')} "
                 + f"risky={self._json_for_prompt(spec.get('risky', False))}"
             )
