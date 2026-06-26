@@ -226,6 +226,59 @@ class CliTests(unittest.TestCase):
             self.assertTrue(report_path.exists())
             self.assertIn("MiniBot Benchmark Core Report", report_path.read_text(encoding="utf-8"))
 
+    def test_cli_metrics_command_writes_methodology_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            mock_path = root / "harness-regression-v2.json"
+            real_path = root / "harness-real-v1.json"
+            report_path = root / "methodology.md"
+            base_row = {
+                "id": "ok",
+                "category": "documentation",
+                "passed": True,
+                "within_budget": True,
+                "verifier_passed": True,
+                "tool_steps": 1,
+                "attempts": 2,
+                "failure_category": "",
+            }
+            mock_path.write_text(
+                json.dumps({"mode": "mock", "summary": {"total_tasks": 1, "passed": 1}, "rows": [base_row]}),
+                encoding="utf-8",
+            )
+            real_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "real",
+                        "reproducibility": {"provider": "http", "model": "mini-real", "api_format": "openai"},
+                        "summary": {"total_tasks": 1, "passed": 1},
+                        "rows": [{**base_row, "mode": "real", "latency_ms": 10, "estimated_cost_usd": 0.0}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            code, stdout, stderr = _capture_main(
+                [
+                    "--cwd",
+                    str(root),
+                    "metrics",
+                    "--methodology-report",
+                    "--harness-artifact-path",
+                    str(mock_path),
+                    "--real-harness-artifact-path",
+                    str(real_path),
+                    "--report-path",
+                    str(report_path),
+                ]
+            )
+
+            self.assertEqual(code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn(str(report_path), stdout)
+            self.assertTrue(report_path.exists())
+            self.assertIn("MiniBot Benchmark Methodology Report", report_path.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
