@@ -18,6 +18,17 @@ from minibot.hooks import (
 from minibot.task_state import STOP_REASON_FINAL_ANSWER_RETURNED
 
 
+class ScriptedMemoryModel:
+    def __init__(self, outputs: list[str]):
+        self.outputs = list(outputs)
+        self.calls = []
+        self.model = "scripted-memory-model"
+
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+        self.calls.append({"prompt": prompt, "max_new_tokens": max_new_tokens, **kwargs})
+        return self.outputs.pop(0)
+
+
 class HookManagerTests(unittest.TestCase):
     def test_hook_failure_is_reported_but_does_not_stop_emit(self):
         manager = HookManager()
@@ -162,6 +173,59 @@ class RuntimeHookTests(unittest.TestCase):
             self.assertEqual(pending[0]["topic"], "user-preferences")
             self.assertEqual(memory_outputs[0]["candidate_count"], 1)
             self.assertEqual(agent.session["memory_maintenance"]["pending_count"], 1)
+
+    def test_stop_hook_uses_mini_llm_memory_extractor_when_configured(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root, ["<final>Noted.</final>"])
+            agent.memory_extraction_model_client = ScriptedMemoryModel(
+                [
+                    '{"should_extract": true, "topic": "key-decisions", "tags": ["decision"], "confidence": "high", "reason": "explicit", "source_refs": ["run"]}',
+                    '{"text": "Keep memory model resolution outside the runtime loop.", "topic": "key-decisions", "tags": ["memory"], "confidence": "high", "source_refs": ["run"]}',
+                ]
+            )
+
+            self.assertEqual(agent.ask("remember: memory model resolution stays outside runtime"), "Noted.")
+
+            run_id = agent.session["runs"]["last_run_id"]
+            report = self.load_report(root, run_id)
+            pending = agent.memory.store.load_pending()
+            stop_outputs = [
+                output
+                for emission in report["hooks"]["emissions"]
+                if emission["event"] == "Stop"
+                for output in emission["outputs"]
+            ]
+            memory_output = next(output["memory_extraction"] for output in stop_outputs if "memory_extraction" in output)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["extraction_method"], "mini_llm")
+            self.assertEqual(memory_output["metadata"]["memory_model_selection_source"], "agent_override")
+            self.assertEqual(memory_output["metadata"]["selected_memory_model"], "scripted-memory-model")
+            self.assertEqual([call["purpose"] for call in agent.memory_extraction_model_client.calls], ["memory_intent", "memory_summary"])
+
+    def test_stop_hook_mini_llm_bad_json_falls_back_without_changing_final_answer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root, ["<final>Done.</final>"])
+            agent.memory_extraction_model_client = ScriptedMemoryModel(["not json"])
+
+            self.assertEqual(agent.ask("remember: keep fallback non-blocking"), "Done.")
+
+            run_id = agent.session["runs"]["last_run_id"]
+            report = self.load_report(root, run_id)
+            stop_outputs = [
+                output
+                for emission in report["hooks"]["emissions"]
+                if emission["event"] == "Stop"
+                for output in emission["outputs"]
+            ]
+            memory_output = next(output["memory_extraction"] for output in stop_outputs if "memory_extraction" in output)
+            self.assertEqual(report["task_state"]["stop_reason"], STOP_REASON_FINAL_ANSWER_RETURNED)
+            self.assertEqual(memory_output["metadata"]["fallback_reason"], "mini_llm_intent_failed")
+            self.assertEqual(memory_output["metadata"]["deterministic_fallback_count"], 1)
+            self.assertEqual(memory_output["metadata"]["candidate_count"], 1)
 
     def test_memory_extraction_hook_failure_is_reported_without_changing_final_answer(self):
         with tempfile.TemporaryDirectory() as temp:

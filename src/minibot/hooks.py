@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import memory as memorylib
+from . import memory_llm
 from .workspace import now
 
 
@@ -179,7 +180,8 @@ def memory_extraction_hook(payload: dict) -> dict | None:
         task_state=task_state,
         source_ref=str(task_state.get("run_id", "")),
     )
-    candidates, metadata = agent.memory.extract_memory_candidates(extraction_payload)
+    engine = memory_llm.build_memory_extraction_engine(agent)
+    candidates, metadata = agent.memory.extract_memory_candidates(extraction_payload, engine=engine)
     pending_results = [agent.memory.append_pending_candidate(candidate) for candidate in candidates]
 
     agent.session["memory"] = agent.memory.to_dict()
