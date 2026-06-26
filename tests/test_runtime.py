@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from minibot import FakeModelClient, MiniBot, SessionStore, WorkspaceContext
 from minibot.context_manager import ContextManager
+from minibot.model_providers import API_FORMAT_OPENAI, ProviderConfig
 from minibot.runtime import SESSION_TOOL_OBSERVATION_LIMIT
 from minibot.task_state import (
     STATUS_COMPLETED,
@@ -28,6 +29,34 @@ class RaisingModelClient:
     def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
         del prompt, max_new_tokens, kwargs
         raise RuntimeError("boom")
+
+
+class CacheAwareModelClient:
+    supports_prompt_cache = True
+
+    def __init__(self):
+        self.config = ProviderConfig(
+            provider="openai",
+            api_format=API_FORMAT_OPENAI,
+            model_name="gpt-mini",
+            prompt_cache="auto",
+            prompt_cache_retention="in-memory",
+        )
+        self.model = "gpt-mini"
+        self.calls: list[dict] = []
+        self.last_completion_metadata = {}
+
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+        self.calls.append({"prompt": prompt, "max_new_tokens": max_new_tokens, "kwargs": dict(kwargs)})
+        self.last_completion_metadata = {
+            "model": self.model,
+            "prompt_cache_supported": True,
+            "prompt_cache_key": kwargs.get("prompt_cache_key", ""),
+            "prompt_cache_retention": kwargs.get("prompt_cache_retention", ""),
+            "cached_tokens": 13,
+            "cache_hit": True,
+        }
+        return "<final>Cache done.</final>"
 
 
 class RuntimeTests(unittest.TestCase):
@@ -189,6 +218,37 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(compact_events[0]["compact_summary"]["trigger"], "prompt_budget_exceeded")
             self.assertEqual(report["prompt_metadata"]["compact_summary"]["trigger"], "prompt_budget_exceeded")
             self.assertTrue(report["prompt_metadata"]["current_request_preserved"])
+
+    def test_cached_tokens_are_recorded_in_prompt_metadata_trace_and_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            model = CacheAwareModelClient()
+            workspace = WorkspaceContext.build(root)
+            agent = MiniBot(
+                model_client=model,
+                workspace=workspace,
+                session_store=SessionStore(root / ".minibot" / "sessions"),
+                approval_policy="auto",
+            )
+
+            self.assertEqual(agent.ask("hello"), "Cache done.")
+
+            self.assertGreaterEqual(len(model.calls), 1)
+            self.assertIn("prompt_cache_key", model.calls[0]["kwargs"])
+            run_id = agent.session["runs"]["last_run_id"]
+            events = self.load_trace_events(root, run_id)
+            requested = [event for event in events if event["event"] == "model_requested"][0]
+            completed = [event for event in events if event["event"] == "model_completed"][0]
+            report = json.loads((root / ".minibot" / "runs" / run_id / "report.json").read_text(encoding="utf-8"))
+
+            self.assertTrue(requested["prompt_cache_eligible"])
+            self.assertTrue(requested["prompt_cache_supported"])
+            self.assertTrue(requested["prompt_cache_sent"])
+            self.assertEqual(completed["prompt_metadata"]["cached_tokens"], 13)
+            self.assertTrue(completed["prompt_metadata"]["cache_hit"])
+            self.assertEqual(report["prompt_metadata"]["cached_tokens"], 13)
+            self.assertEqual(report["model"]["cached_tokens"], 13)
 
 
 if __name__ == "__main__":

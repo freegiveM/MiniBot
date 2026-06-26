@@ -57,6 +57,28 @@ class ContextManagerTests(unittest.TestCase):
                 self.assertGreaterEqual(section["raw_chars"], section["chars"])
                 self.assertFalse(section["truncated"])
                 self.assertEqual(section["truncation_reason"], "")
+                self.assertIn(section["cache_class"], {"stable_prefix", "dynamic"})
+            self.assertEqual(metadata["sections"]["identity"]["cache_class"], "stable_prefix")
+            self.assertEqual(metadata["sections"]["history"]["cache_class"], "dynamic")
+            self.assertTrue(metadata["prompt_cache_key"].startswith("minibot:v1:"))
+            self.assertEqual(metadata["cacheable_sections"], ["identity", "workspace", "tools", "memory_index"])
+            self.assertIn("history", metadata["dynamic_sections"])
+            self.assertIn("stable_prefix_hash", metadata["prompt_cache"])
+
+    def test_prompt_cache_key_ignores_current_request_history_and_working_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root)
+
+            _, first = agent.context_manager.build("first request")
+            agent.session["history"] = [{"role": "assistant", "content": "different history"}]
+            agent.memory.remember_tool("read_file", status="succeeded", path="README.md")
+            agent.session["memory"] = agent.memory.to_dict()
+            _, second = agent.context_manager.build("second request with new text")
+
+            self.assertEqual(first["stable_prefix_hash"], second["stable_prefix_hash"])
+            self.assertEqual(first["prompt_cache_key"], second["prompt_cache_key"])
 
     def test_identity_section_spells_out_tool_call_schema(self):
         with tempfile.TemporaryDirectory() as temp:
