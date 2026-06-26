@@ -15,7 +15,18 @@ from .metrics import (
     DEFAULT_RETRIEVAL_ARTIFACT_PATH,
     write_benchmark_core_report,
 )
-from .models import FakeModelClient
+from .model_providers import (
+    API_FORMAT_ANTHROPIC,
+    API_FORMAT_OPENAI,
+    PROVIDER_ANTHROPIC,
+    PROVIDER_DEEPSEEK,
+    PROVIDER_FAKE,
+    PROVIDER_HTTP,
+    PROVIDER_OPENAI,
+    ProviderConfigurationError,
+    build_model_client_from_config,
+    resolve_provider_config,
+)
 from .runtime import MiniBot, SessionStore
 from .workspace import WorkspaceContext
 
@@ -28,7 +39,8 @@ MINIBOT_BANNER = r"""MiniBot
 """
 COMMANDS = frozenset({"benchmark", "metrics"})
 APPROVAL_CHOICES = ("ask", "auto", "deny_risky", "never")
-MODEL_PROVIDER_CHOICES = ("fake",)
+MODEL_PROVIDER_CHOICES = (PROVIDER_FAKE, PROVIDER_HTTP, PROVIDER_OPENAI, PROVIDER_ANTHROPIC, PROVIDER_DEEPSEEK)
+API_FORMAT_CHOICES = (API_FORMAT_OPENAI, API_FORMAT_ANTHROPIC)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cwd", default=".", help="Workspace directory.")
     parser.add_argument("--approval", choices=APPROVAL_CHOICES, default="ask", help="Approval policy for risky tools.")
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool steps.")
-    parser.add_argument("--model-provider", choices=MODEL_PROVIDER_CHOICES, default="fake", help="Model provider.")
+    parser.add_argument("--model-provider", choices=MODEL_PROVIDER_CHOICES, default=None, help="Model provider.")
+    parser.add_argument("--api-format", choices=API_FORMAT_CHOICES, default=None, help="HTTP provider wire format.")
+    parser.add_argument("--model-name", default=None, help="Provider model name.")
+    parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
+    parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
+    parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
     parser.add_argument(
         "--fake-response",
         default="<final>MiniBot scaffold is running.</final>",
@@ -92,7 +109,12 @@ def build_agent_parser() -> argparse.ArgumentParser:
         help="Approval policy for risky tools.",
     )
     parser.add_argument("--max-steps", type=int, default=6, help="Maximum tool steps.")
-    parser.add_argument("--model-provider", choices=MODEL_PROVIDER_CHOICES, default="fake", help="Model provider.")
+    parser.add_argument("--model-provider", choices=MODEL_PROVIDER_CHOICES, default=None, help="Model provider.")
+    parser.add_argument("--api-format", choices=API_FORMAT_CHOICES, default=None, help="HTTP provider wire format.")
+    parser.add_argument("--model-name", default=None, help="Provider model name.")
+    parser.add_argument("--base-url", default=None, help="Provider endpoint URL.")
+    parser.add_argument("--api-key-env", default=None, help="Environment variable or .env key containing the API key.")
+    parser.add_argument("--env-file", default=".env", help="Provider .env file path.")
     parser.add_argument(
         "--fake-response",
         default="<final>MiniBot scaffold is running.</final>",
@@ -134,7 +156,20 @@ def run_agent_command(argv: list[str]) -> int:
     if not cwd.exists() or not cwd.is_dir():
         print(f"minibot: --cwd does not exist or is not a directory: {cwd}", file=sys.stderr)
         return 2
-    model = build_model_client(parsed.model_provider, parsed.fake_response)
+    try:
+        model = build_model_client(
+            cwd=cwd,
+            env_file=parsed.env_file,
+            model_provider=parsed.model_provider,
+            api_format=parsed.api_format,
+            model_name=parsed.model_name,
+            base_url=parsed.base_url,
+            api_key_env=parsed.api_key_env,
+            fake_response=parsed.fake_response,
+        )
+    except ProviderConfigurationError as exc:
+        print(f"minibot: provider configuration error: {exc}", file=sys.stderr)
+        return 2
     workspace = WorkspaceContext.build(cwd)
     state_root = Path(workspace.repo_root) / ".minibot"
     session_store = SessionStore(state_root / "sessions")
@@ -183,10 +218,27 @@ def run_metrics_command(argv: list[str]) -> int:
     return 0
 
 
-def build_model_client(model_provider: str, fake_response: str) -> FakeModelClient:
-    if model_provider == "fake":
-        return FakeModelClient([fake_response], model="fake-cli")
-    raise ValueError(f"unsupported model provider: {model_provider}")
+def build_model_client(
+    *,
+    cwd: str | Path = ".",
+    env_file: str | Path = ".env",
+    model_provider: str | None = None,
+    api_format: str | None = None,
+    model_name: str | None = None,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
+    fake_response: str = "<final>MiniBot scaffold is running.</final>",
+):
+    config = resolve_provider_config(
+        cwd=cwd,
+        env_file=env_file,
+        model_provider=model_provider,
+        api_format=api_format,
+        model_name=model_name,
+        base_url=base_url,
+        api_key_env=api_key_env,
+    )
+    return build_model_client_from_config(config, fake_response=fake_response)
 
 
 def _split_command(argv: list[str]) -> tuple[str, list[str]]:
