@@ -420,19 +420,6 @@ tests/
   test_*.py           # unit and regression tests
 ```
 
-## 简历表述建议
-
-可以安全写：
-
-> 设计并实现一个本地 Coding Agent 原型 MiniBot，包含 ReAct 工具调用、权限管线、上下文压缩、分层记忆、miniLLM memory extraction、provider adapter、交互式 REPL 和固定 benchmark harness；构建可复现评测流程，使用 deterministic fake model 覆盖 12 个核心机制任务，并生成 metrics/methodology report 分析 pass rate、failure taxonomy、tool steps 和 provider error。
-
-不要过度声称：
-
-- 不要说 MiniBot 达到了 SWE-bench / GAIA / WebArena 的同级别能力。
-- 不要用一次 real-model run 代表模型泛化能力。
-- 不要说 memory 已经解决长期个性化，只能说有 pending memory 和可审计 extraction 机制。
-- 不要说 prompt cache 一定降低成本；当前只是 provider-aware key 和 usage 记录，真实收益依赖 provider。
-
 ## License
 
 本项目使用仓库中的 `LICENSE` 文件声明的许可证。
