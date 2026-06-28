@@ -219,6 +219,8 @@ referenceMaterial/
 # Local-only planning / interview preparation
 Note/
 docs/*spec*.md
+docs/minibot-benchmark-bugfix-plan.md
+docs/minibot-resume-evaluation-plan.md
 docs/review-pack/
 minibot-resume-star-rewrite.local.md
 *.local.md
