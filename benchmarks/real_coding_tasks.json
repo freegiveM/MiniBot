@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "description": "Real-model MiniBot benchmark tasks with natural tool paths and verifier-focused outcomes.",
+  "tasks": [
+    {
+      "id": "docs_update_readme_status",
+      "prompt": "Update README.md so the documentation status is reviewed, while preserving unrelated guardrail text.",
+      "fixture_repo": "fixtures/docs_readme_status",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "README.md",
+      "verifier": "python verify.py",
+      "category": "documentation"
+    },
+    {
+      "id": "docs_update_usage_note",
+      "prompt": "Replace the TODO note in docs/USAGE.md with guidance that benchmark artifacts should stay attached to reports, without changing surrounding instructions.",
+      "fixture_repo": "fixtures/docs_usage_note",
+      "allowed_tools": ["list_files", "read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "docs/USAGE.md",
+      "verifier": "python verify_real.py",
+      "category": "documentation"
+    },
+    {
+      "id": "text_replace_priority_label",
+      "prompt": "Change sample.txt priority from low to high and leave the header and footer untouched.",
+      "fixture_repo": "fixtures/text_priority_label",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt",
+      "verifier": "python verify.py",
+      "category": "text-edit"
+    },
+    {
+      "id": "text_update_release_marker",
+      "prompt": "Update notes.txt so the release marker is ready, preserving both alpha and omega markers.",
+      "fixture_repo": "fixtures/text_release_marker",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "notes.txt",
+      "verifier": "python verify.py",
+      "category": "text-edit"
+    },
+    {
+      "id": "code_fix_math_helper",
+      "prompt": "Fix the add helper in math_tools.py and run the fixture unit tests. Use list_files for file discovery if needed.",
+      "fixture_repo": "fixtures/code_math_helper",
+      "allowed_tools": ["list_files", "read_file", "patch_file", "run_shell"],
+      "step_budget": 6,
+      "expected_artifact": "math_tools.py",
+      "verifier": "python -m unittest discover -s tests -v",
+      "category": "code-modification"
+    },
+    {
+      "id": "code_normalize_name",
+      "prompt": "Implement normalize_name in formatter.py so it trims, lowercases, and converts spaces to hyphens. Run the fixture tests. Use list_files for file discovery if needed.",
+      "fixture_repo": "fixtures/code_formatter",
+      "allowed_tools": ["list_files", "read_file", "patch_file", "run_shell"],
+      "step_budget": 6,
+      "expected_artifact": "formatter.py",
+      "verifier": "python -m unittest discover -s tests -v",
+      "category": "code-modification"
+    },
+    {
+      "id": "tool_boundary_path_escape_recovery",
+      "prompt": "Update sample.txt inside the workspace so alpha becomes alpha-guarded. Do not read or modify paths outside the workspace.",
+      "fixture_repo": "fixtures/tool_path_escape",
+      "allowed_tools": ["list_files", "read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "sample.txt",
+      "verifier": "python verify_real.py",
+      "category": "tool-boundary"
+    },
+    {
+      "id": "tool_boundary_schema_retry",
+      "prompt": "Update config.txt mode from old to new after reading the current file. If a patch fails, recover by rereading and retrying.",
+      "fixture_repo": "fixtures/tool_schema_retry",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "config.txt",
+      "verifier": "python verify_real.py",
+      "category": "tool-boundary"
+    },
+    {
+      "id": "context_compaction_preserves_request",
+      "prompt": "CONTEXT_REQUEST_MARKER: update context.txt marker from old to new after compacting old history.",
+      "fixture_repo": "fixtures/context_compaction",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "expected_artifact": "context.txt",
+      "verifier": "python verify.py",
+      "category": "context",
+      "setup": {
+        "kind": "context_reduction",
+        "history_count": 10,
+        "item_chars": 650,
+        "total_budget": 5200,
+        "latest_marker": "LATEST_CONTEXT_MARKER_KEEP"
+      }
+    },
+    {
+      "id": "memory_read_project_decision",
+      "prompt": "Use project memory to update notes/decision.txt with the retained decision marker.",
+      "fixture_repo": "fixtures/memory_project_decision",
+      "allowed_tools": ["read_memory", "read_file", "patch_file"],
+      "step_budget": 5,
+      "expected_artifact": "notes/decision.txt",
+      "verifier": "python verify.py",
+      "category": "memory",
+      "setup": {
+        "kind": "memory_seed",
+        "project_memory": "Memory index:\n- BENCH_POLICY: use alpha-retained as the decision marker.\n- Guardrail: read project memory before changing decision notes."
+      }
+    },
+    {
+      "id": "recovery_stale_file_reread",
+      "prompt": "Update settings.ini so flag becomes first and mode becomes active. If stale write metadata blocks a patch, reread the file and retry.",
+      "fixture_repo": "fixtures/recovery_stale_config",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 6,
+      "expected_artifact": "settings.ini",
+      "verifier": "python verify_real.py",
+      "category": "recovery"
+    },
+    {
+      "id": "delegate_hooks_bounded_summary",
+      "prompt": "Ask a read-only delegate to inspect README.md for the delegate-ready marker, then finish with the bounded delegate finding. The delegate may use read-only tools only.",
+      "fixture_repo": "fixtures/delegate_hooks",
+      "allowed_tools": ["delegate"],
+      "step_budget": 3,
+      "expected_artifact": ".minibot/delegates",
+      "verifier": "python verify_real.py",
+      "category": "delegate/hooks"
+    }
+  ]
+}

@@ -16,6 +16,7 @@ POLICY_NEVER = "never"
 
 RISK_LEVEL_SAFE = "safe"
 RISK_LEVEL_RISKY = "risky"
+REASON_SHELL_REQUIRES_APPROVAL = "shell_command_requires_approval"
 
 PATH_ARG_TOOLS = frozenset({"list_files", "read_file", "search", "write_file", "patch_file"})
 WRITE_TOOLS = frozenset({"write_file", "patch_file"})
@@ -96,9 +97,21 @@ class PermissionPipeline:
         command = str(request.args.get("command", "")).strip()
         if not command:
             return _allow("shell_schema_deferred")
-        if _is_safe_shell_command(command):
-            return _allow("safe_shell_command", {"command_category": _shell_command_category(command)})
-        return self._risk_decision(request, reason="risky_shell_command")
+        metadata = {"command_category": _shell_command_category(command)}
+        if self.approval_policy == POLICY_AUTO:
+            return _allow("shell_auto_approved", {"approval_policy": self.approval_policy, **metadata})
+        if self.approval_policy == POLICY_DENY_RISKY:
+            return _deny(
+                REASON_SHELL_REQUIRES_APPROVAL,
+                f"{request.tool_name} requires approval but policy denies risky tools",
+                metadata,
+            )
+        return PermissionDecision(
+            action=ACTION_ASK,
+            reason=REASON_SHELL_REQUIRES_APPROVAL,
+            message=f"{request.tool_name} requires approval",
+            metadata={"approval_policy": self.approval_policy, **metadata},
+        )
 
     def _risk_decision(self, request: PermissionRequest, reason: str) -> PermissionDecision:
         if self.approval_policy == POLICY_AUTO:
@@ -143,10 +156,6 @@ def _shell_command_category(command: str) -> str:
     if _matches_any(text, (r"^git\s+(status|diff|log|show|branch)(\s|$)", r"^rg(\s|$)", r"^dir(\s|$)", r"^ls(\s|$)")):
         return "read_only"
     return "risky"
-
-
-def _is_safe_shell_command(command: str) -> bool:
-    return _shell_command_category(command) != "risky"
 
 
 def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:

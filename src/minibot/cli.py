@@ -97,6 +97,7 @@ def build_benchmark_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
     parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument("--temperature", type=float, default=0.0, help="Provider decoding temperature.")
+    parser.add_argument("--approval", choices=APPROVAL_CHOICES, default="auto", help="Approval policy simulated inside benchmark tasks.")
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum provider output tokens.")
     parser.add_argument("--max-tasks", type=int, default=None, help="Limit benchmark tasks.")
     parser.add_argument("--max-estimated-cost", type=float, default=None, help="Stop after this estimated USD cost.")
@@ -270,6 +271,7 @@ def run_benchmark_command(argv: list[str]) -> int:
             prompt_cache=parsed.prompt_cache,
             prompt_cache_retention=parsed.prompt_cache_retention,
             temperature=parsed.temperature,
+            approval_policy=parsed.approval,
             max_new_tokens=parsed.max_new_tokens,
             max_tasks=parsed.max_tasks,
             max_estimated_cost=parsed.max_estimated_cost,
