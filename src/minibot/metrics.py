@@ -21,7 +21,7 @@ STATUS_MISSING = "missing"
 STATUS_PRESENT = "present"
 STATUS_INVALID = "invalid"
 
-RISKY_PERMISSION_REASONS = frozenset({"risky_tool", "risky_shell_command"})
+RISKY_PERMISSION_REASONS = frozenset({"risky_tool", "risky_shell_command", "shell_command_requires_approval"})
 
 
 @dataclass(frozen=True)
@@ -126,6 +126,7 @@ def aggregate_benchmark_artifact(path: str | Path) -> dict[str, Any]:
         "reproducibility": artifact.get("reproducibility", {})
         if isinstance(artifact.get("reproducibility"), dict)
         else {},
+        "approval_policy": _approval_policy(artifact, rows),
         "task_count": task_count,
         "passed": passed,
         "failed": max(task_count - passed, 0),
@@ -743,6 +744,7 @@ def _render_report(harness: dict[str, Any], ablations: list[dict[str, Any]]) -> 
         f"- Captured at: `{_md_escape(harness.get('captured_at') or NOT_AVAILABLE)}`",
         f"- Benchmark: `{_md_escape(_nested_get(harness, ('benchmark', 'path'), NOT_AVAILABLE))}`",
         f"- Model source: `{_md_escape(_nested_get(harness, ('reproducibility', 'model_name'), NOT_AVAILABLE))}`",
+        f"- Approval policy: `{_md_escape(harness.get('approval_policy') or NOT_AVAILABLE)}`",
         "- Metrics in this report are derived from existing evaluator and ablation JSON artifacts only.",
         "",
         "## 可以安全写进简历的指标",
@@ -760,6 +762,7 @@ def _render_report(harness: dict[str, Any], ablations: list[dict[str, Any]]) -> 
         ("category_pass_rates", harness["category_pass_rates"], "row.category + row.passed"),
         ("avg_attempts", harness["avg_attempts"], "row.attempts"),
         ("failure_category_counts", harness["failure_category_counts"], "row.failure_category"),
+        ("approval_policy", harness["approval_policy"], "reproducibility.approval_policy"),
         ("path_escape_rejection_count", harness["path_escape_rejection_count"], "permission evidence"),
         ("risky_tool_block_rate", harness["risky_tool_block_rate"], "permission evidence"),
         ("approval_denied_count", harness["approval_denied_count"], "permission evidence"),
@@ -913,6 +916,17 @@ def _artifact_rows(artifact: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise ValueError("benchmark artifact rows must be a list")
     return [row for row in rows if isinstance(row, dict)]
+
+
+def _approval_policy(artifact: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    policy = _text(_nested_get(artifact, ("reproducibility", "approval_policy"))).strip()
+    if policy:
+        return policy
+    for row in rows:
+        policy = _text(row.get("approval_policy")).strip()
+        if policy:
+            return policy
+    return ""
 
 
 def _count_true(rows: list[dict[str, Any]], key: str) -> int:

@@ -38,7 +38,7 @@ class PermissionPipelineTests(unittest.TestCase):
             self.assertEqual(decision.action, ACTION_DENY)
             self.assertEqual(decision.reason, "path_escape")
 
-    def test_permission_allows_safe_shell_command(self):
+    def test_permission_requires_approval_for_safe_shell_command(self):
         with tempfile.TemporaryDirectory() as temp:
             decision = PermissionPipeline(temp, approval_policy=POLICY_ASK).check(
                 PermissionRequest(
@@ -49,8 +49,9 @@ class PermissionPipelineTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(decision.action, ACTION_ALLOW)
-            self.assertEqual(decision.reason, "safe_shell_command")
+            self.assertEqual(decision.action, ACTION_ASK)
+            self.assertEqual(decision.reason, "shell_command_requires_approval")
+            self.assertEqual(decision.metadata["approval_policy"], POLICY_ASK)
             self.assertEqual(decision.metadata["command_category"], "test")
 
     def test_permission_routes_risky_shell_by_policy(self):
@@ -62,14 +63,21 @@ class PermissionPipelineTests(unittest.TestCase):
                 workspace_root=temp,
             )
 
-            self.assertEqual(PermissionPipeline(temp, approval_policy=POLICY_AUTO).check(request).action, ACTION_ALLOW)
+            auto = PermissionPipeline(temp, approval_policy=POLICY_AUTO).check(request)
             ask = PermissionPipeline(temp, approval_policy=POLICY_ASK).check(request)
             deny = PermissionPipeline(temp, approval_policy=POLICY_DENY_RISKY).check(request)
             legacy_never = PermissionPipeline(temp, approval_policy="never").check(request)
 
+            self.assertEqual(auto.action, ACTION_ALLOW)
+            self.assertEqual(auto.reason, "shell_auto_approved")
+            self.assertEqual(auto.metadata["approval_policy"], POLICY_AUTO)
+            self.assertEqual(auto.metadata["command_category"], "risky")
             self.assertEqual(ask.action, ACTION_ASK)
-            self.assertEqual(ask.reason, "risky_shell_command")
+            self.assertEqual(ask.reason, "shell_command_requires_approval")
+            self.assertEqual(ask.metadata["command_category"], "risky")
             self.assertEqual(deny.action, ACTION_DENY)
+            self.assertEqual(deny.reason, "shell_command_requires_approval")
+            self.assertEqual(deny.metadata["command_category"], "risky")
             self.assertEqual(legacy_never.action, ACTION_DENY)
 
     def test_permission_read_only_denies_risky_write_tool(self):
@@ -78,6 +86,20 @@ class PermissionPipelineTests(unittest.TestCase):
                 PermissionRequest(
                     tool_name="write_file",
                     args={"path": "out.txt", "content": "hello"},
+                    risk_level=RISK_LEVEL_RISKY,
+                    workspace_root=temp,
+                )
+            )
+
+            self.assertEqual(decision.action, ACTION_DENY)
+            self.assertEqual(decision.reason, "read_only")
+
+    def test_permission_read_only_denies_run_shell(self):
+        with tempfile.TemporaryDirectory() as temp:
+            decision = PermissionPipeline(temp, approval_policy=POLICY_AUTO, read_only=True).check(
+                PermissionRequest(
+                    tool_name="run_shell",
+                    args={"command": "python -m unittest discover -s tests -v"},
                     risk_level=RISK_LEVEL_RISKY,
                     workspace_root=temp,
                 )

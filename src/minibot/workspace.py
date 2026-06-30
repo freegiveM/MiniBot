@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import textwrap
 from dataclasses import dataclass
@@ -49,25 +50,38 @@ class WorkspaceContext:
     def build(cls, cwd: str | Path, repo_root_override: str | Path | None = None) -> "WorkspaceContext":
         cwd = Path(cwd).resolve()
 
-        def git(args: list[str], fallback: str = "") -> str:
+        def run_git(args: list[str], fallback: str = "", *, git_cwd: Path | None = None, env: dict | None = None) -> str:
             try:
                 result = subprocess.run(
                     ["git", *args],
-                    cwd=cwd,
+                    cwd=git_cwd or cwd,
                     capture_output=True,
                     text=True,
                     check=True,
                     timeout=5,
+                    env=env,
                 )
                 return result.stdout.strip() or fallback
             except Exception:
                 return fallback
 
-        repo_root = (
-            Path(repo_root_override).resolve()
-            if repo_root_override is not None
-            else Path(git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
-        )
+        if repo_root_override is not None:
+            repo_root = Path(repo_root_override).resolve()
+            git_enabled = (repo_root / ".git").exists()
+            git_cwd = repo_root
+            git_env = os.environ.copy()
+            git_env["GIT_CEILING_DIRECTORIES"] = str(repo_root.parent)
+        else:
+            repo_root = Path(run_git(["rev-parse", "--show-toplevel"], str(cwd))).resolve()
+            git_enabled = True
+            git_cwd = cwd
+            git_env = None
+
+        def git(args: list[str], fallback: str = "") -> str:
+            if not git_enabled:
+                return fallback
+            return run_git(args, fallback, git_cwd=git_cwd, env=git_env)
+
         docs: dict[str, str] = {}
         for name in DOC_NAMES:
             path = repo_root / name

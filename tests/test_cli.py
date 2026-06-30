@@ -249,6 +249,8 @@ class CliTests(unittest.TestCase):
                     str(artifact_path),
                     "--real",
                     "--dry-run",
+                    "--approval",
+                    "deny_risky",
                     "--max-tasks",
                     "2",
                 ]
@@ -262,6 +264,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(summary["total_tasks"], 0)
             saved = json.loads(artifact_path.read_text(encoding="utf-8"))
             self.assertEqual(saved["mode"], "real")
+            self.assertEqual(saved["reproducibility"]["approval_policy"], "deny_risky")
             self.assertEqual(saved["benchmark"]["selected_task_ids"][0], "docs_update_readme_status")
             self.assertEqual(saved["benchmark"]["selected_task_ids"][1], "text_replace_priority_label")
 

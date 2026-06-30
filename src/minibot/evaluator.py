@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import locale
+import re
 import shutil
 import subprocess
 import time
@@ -15,6 +16,7 @@ from typing import Callable
 from .context_manager import ContextManager
 from .models import FakeModelClient
 from .model_providers import ProviderConfig, build_model_client_from_config, resolve_provider_config
+from .permission import POLICY_ASK, POLICY_AUTO, POLICY_DENY_RISKY, POLICY_NEVER
 from .prompt_cache import PROMPT_CACHE_MODES, PROMPT_CACHE_RETENTIONS
 from .runtime import MiniBot, SessionStore
 from .task_state import STOP_REASON_FINAL_ANSWER_RETURNED, STOP_REASON_MODEL_ERROR, STOP_REASON_TOOL_ERROR
@@ -30,6 +32,7 @@ REAL_DEFAULT_MAX_TASKS = 5
 REAL_SMOKE_CATEGORY_ORDER = ("documentation", "text-edit", "code-modification", "tool-boundary", "memory")
 MODE_MOCK = "mock"
 MODE_REAL = "real"
+APPROVAL_POLICIES = (POLICY_ASK, POLICY_AUTO, POLICY_DENY_RISKY, POLICY_NEVER)
 REQUIRED_TASK_FIELDS = (
     "id",
     "prompt",
@@ -122,6 +125,7 @@ class Benchmark:
 @dataclass(frozen=True)
 class BenchmarkRunConfig:
     mode: str = MODE_MOCK
+    approval_policy: str = POLICY_AUTO
     max_new_tokens: int = 512
     temperature: float = 0.0
     max_tasks: int | None = None
@@ -169,6 +173,7 @@ def run_fixed_benchmark(
     prompt_cache: str | None = None,
     prompt_cache_retention: str | None = None,
     temperature: float = 0.0,
+    approval_policy: str = POLICY_AUTO,
     max_new_tokens: int = 512,
     max_tasks: int | None = None,
     max_estimated_cost: float | None = None,
@@ -191,6 +196,7 @@ def run_fixed_benchmark(
         prompt_cache=prompt_cache,
         prompt_cache_retention=prompt_cache_retention,
         temperature=temperature,
+        approval_policy=approval_policy,
         max_new_tokens=max_new_tokens,
         max_tasks=max_tasks,
         max_estimated_cost=max_estimated_cost,
@@ -247,7 +253,7 @@ def _run_task(
         model_client=model,
         workspace=workspace,
         session_store=SessionStore(fixture_copy / ".minibot" / "sessions"),
-        approval_policy="auto",
+        approval_policy=config.approval_policy,
         max_steps=task.step_budget,
         max_new_tokens=config.max_new_tokens,
     )
@@ -290,6 +296,7 @@ def _run_task(
         "category": task.category,
         "allowed_tools": list(task.allowed_tools),
         "step_budget": task.step_budget,
+        "approval_policy": config.approval_policy,
         "expected_artifact": list(task.expected_artifact),
         "expected_artifact_exists": expected_artifact_exists,
         "verifier": task.verifier,
@@ -363,6 +370,7 @@ def _benchmark_run_config(
     prompt_cache: str | None,
     prompt_cache_retention: str | None,
     temperature: float,
+    approval_policy: str,
     max_new_tokens: int,
     max_tasks: int | None,
     max_estimated_cost: float | None,
@@ -372,6 +380,7 @@ def _benchmark_run_config(
     mode = MODE_REAL if real or _real_provider_requested(model_provider) else MODE_MOCK
     max_new_tokens = _positive_int(max_new_tokens, "max_new_tokens")
     temperature = _float_arg(temperature, "temperature")
+    approval_policy = _approval_policy_arg(approval_policy)
     normalized_max_tasks = _optional_positive_int(max_tasks, "max_tasks")
     normalized_max_cost = _optional_non_negative_float(max_estimated_cost, "max_estimated_cost")
     provider_config = None
@@ -401,6 +410,7 @@ def _benchmark_run_config(
         )
     return BenchmarkRunConfig(
         mode=mode,
+        approval_policy=approval_policy,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         max_tasks=normalized_max_tasks,
@@ -479,6 +489,7 @@ def _reproducibility_metadata(root: Path, tasks: tuple[BenchmarkTask, ...], conf
     metadata = {
         "fixture_snapshot_id": _benchmark_snapshot_id(root, tasks),
         "mode": config.mode,
+        "approval_policy": config.approval_policy,
         "decoding": {"temperature": config.temperature, "top_p": 1.0, "max_new_tokens": config.max_new_tokens},
         "timezone": datetime.now(timezone.utc).astimezone().tzname() or "UTC",
         "locale": locale.setlocale(locale.LC_CTYPE, None),
@@ -582,6 +593,20 @@ def _apply_task_setup(agent: MiniBot, setup: dict) -> None:
         memory_root = agent.root / ".minibot" / "memory"
         memory_root.mkdir(parents=True, exist_ok=True)
         (memory_root / "MEMORY.md").write_text(text + "\n", encoding="utf-8")
+        topics = setup.get("topics", {})
+        if topics:
+            if not isinstance(topics, dict):
+                raise ValueError("setup.topics must be an object")
+            topics_dir = memory_root / "topics"
+            topics_dir.mkdir(parents=True, exist_ok=True)
+            for topic, body in topics.items():
+                topic_name = str(topic).strip()
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", topic_name):
+                    raise ValueError("setup.topics contains an invalid topic name")
+                topic_text = str(body).strip()
+                if not topic_text:
+                    raise ValueError("setup.topics values must be non-empty strings")
+                (topics_dir / f"{topic_name}.md").write_text(topic_text + "\n", encoding="utf-8")
         return
     raise ValueError(f"unsupported benchmark setup kind: {kind}")
 
@@ -720,6 +745,13 @@ def _float_arg(value: object, key: str) -> float:
         raise ValueError(f"{key} must be a number") from exc
 
 
+def _approval_policy_arg(value: object) -> str:
+    policy = str(value or POLICY_AUTO).strip().lower()
+    if policy not in APPROVAL_POLICIES:
+        raise ValueError(f"approval_policy must be one of: {', '.join(APPROVAL_POLICIES)}")
+    return policy
+
+
 def _optional_non_negative_float(value: object, key: str) -> float | None:
     if value in (None, ""):
         return None
@@ -820,6 +852,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-cache", choices=PROMPT_CACHE_MODES, default=None, help="Provider prompt cache mode.")
     parser.add_argument("--prompt-cache-retention", choices=PROMPT_CACHE_RETENTIONS, default=None, help="Provider prompt cache retention.")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--approval", choices=APPROVAL_POLICIES, default=POLICY_AUTO)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-tasks", type=int, default=None)
     parser.add_argument("--max-estimated-cost", type=float, default=None)
@@ -843,6 +876,7 @@ def main(argv: list[str] | None = None) -> int:
         prompt_cache=args.prompt_cache,
         prompt_cache_retention=args.prompt_cache_retention,
         temperature=args.temperature,
+        approval_policy=args.approval,
         max_new_tokens=args.max_new_tokens,
         max_tasks=args.max_tasks,
         max_estimated_cost=args.max_estimated_cost,

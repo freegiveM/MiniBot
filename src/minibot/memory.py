@@ -16,6 +16,26 @@ RELEVANT_MEMORY_LIMIT = 3
 PROJECT_MEMORY_MAX_CHARS = 1200
 TOPIC_MEMORY_MAX_CHARS = 1200
 PENDING_MEMORY_LIMIT = 200
+PENDING_PROMOTION_LIMIT = 5
+PENDING_PROMOTION_THRESHOLD = 90
+SOURCE_EXPLICIT_USER_INSTRUCTION = "explicit_user_instruction"
+SOURCE_TOOL_VERIFIED_FACT = "tool_verified_fact"
+SOURCE_TOOL_ERROR_LESSON = "tool_error_lesson"
+SOURCE_ASSISTANT_INFERENCE = "assistant_inference"
+SOURCE_MEMORY_EXTRACTION = "memory_extraction"
+MEMORY_SOURCE_TYPE_WEIGHTS = {
+    SOURCE_EXPLICIT_USER_INSTRUCTION: 100,
+    SOURCE_TOOL_VERIFIED_FACT: 75,
+    SOURCE_TOOL_ERROR_LESSON: 55,
+    SOURCE_ASSISTANT_INFERENCE: 20,
+    SOURCE_MEMORY_EXTRACTION: 20,
+}
+CONFIDENCE_SCORES = {
+    "high": 1.0,
+    "medium": 0.6,
+    "low": 0.3,
+    "unknown": 0.0,
+}
 MEMORY_TOPICS = (
     "project-context",
     "user-preferences",
@@ -159,6 +179,47 @@ def secret_shaped(text: object) -> bool:
     return any(re.search(pattern, raw, re.I) for pattern in SECRET_PATTERNS)
 
 
+def normalize_confidence(value: object) -> tuple[str, float]:
+    raw = str(value or "").strip().lower()
+    if raw in CONFIDENCE_SCORES:
+        return raw, CONFIDENCE_SCORES[raw]
+    return "unknown", 0.0
+
+
+def normalize_source_type(value: object) -> str:
+    raw = str(value or "").strip()
+    if raw == SOURCE_MEMORY_EXTRACTION:
+        return SOURCE_ASSISTANT_INFERENCE
+    if raw in MEMORY_SOURCE_TYPE_WEIGHTS:
+        return raw
+    return SOURCE_ASSISTANT_INFERENCE
+
+
+def source_type_weight(source_type: object) -> int:
+    normalized = normalize_source_type(source_type)
+    return int(MEMORY_SOURCE_TYPE_WEIGHTS.get(normalized, 0))
+
+
+def score_pending_candidate(candidate: dict) -> int:
+    if not isinstance(candidate, dict):
+        return 0
+    text = str(candidate.get("text", "")).strip()
+    if not text or secret_shaped(text):
+        return 0
+    source_weight = source_type_weight(candidate.get("source_type", ""))
+    _, confidence_score = normalize_confidence(candidate.get("confidence", "unknown"))
+    return int(source_weight + confidence_score * 40)
+
+
+def _display_memory_path(path: Path, workspace_root: str | Path | None = None) -> str:
+    if workspace_root is None:
+        return path.as_posix()
+    try:
+        return path.resolve().relative_to(Path(workspace_root).resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 @dataclass
 class MemoryCandidate:
     text: str
@@ -178,15 +239,22 @@ class MemoryCandidate:
         self.text = clip(str(self.text).strip(), 500)
         self.topic = _safe_topic(self.topic)
         self.tags = _safe_tags(self.tags)
-        self.source_type = str(self.source_type).strip()
+        self.source_type = normalize_source_type(self.source_type)
         self.source_ref = str(self.source_ref).strip()
-        self.confidence = str(self.confidence or "medium").strip()
+        raw_confidence = self.confidence
+        self.confidence, _ = normalize_confidence(raw_confidence)
         self.extraction_method = str(self.extraction_method or "deterministic").strip()
         self.rejected_reason = str(self.rejected_reason).strip()
         self.created_at = str(self.created_at).strip() or now()
         self.id = str(self.id).strip() or "mem_" + _normal_hash(f"{self.topic}:{self.text}")
         if not isinstance(self.metadata, dict):
             self.metadata = {}
+        raw_confidence_text = str(raw_confidence or "").strip().lower()
+        if raw_confidence_text and raw_confidence_text not in CONFIDENCE_SCORES:
+            warnings = _safe_tags(self.metadata.get("schema_warnings", []), limit=12)
+            if "invalid_confidence" not in warnings:
+                warnings.append("invalid_confidence")
+            self.metadata["schema_warnings"] = warnings
 
     def to_dict(self) -> dict:
         return {
@@ -218,7 +286,7 @@ class MemoryCandidate:
             tags=_safe_tags(value.get("tags", [])),
             source_type=str(value.get("source_type", "")).strip(),
             source_ref=str(value.get("source_ref", "")).strip(),
-            confidence=str(value.get("confidence", "medium")).strip(),
+            confidence=str(value.get("confidence", "unknown")).strip(),
             extraction_method=str(value.get("extraction_method", "deterministic")).strip(),
             needs_review=bool(value.get("needs_review", True)),
             rejected_reason=str(value.get("rejected_reason", "")).strip(),
@@ -375,6 +443,56 @@ class MemoryStore:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(item.to_dict(), sort_keys=True, ensure_ascii=False) + "\n")
         return {"appended": True, "duplicate": False, "rejected": False, "id": item.id}
+
+    def select_promotable_pending(
+        self,
+        limit: int = PENDING_PROMOTION_LIMIT,
+        threshold: int = PENDING_PROMOTION_THRESHOLD,
+    ) -> list[dict]:
+        limit_count = max(0, int(limit))
+        if limit_count == 0:
+            return []
+        candidates = []
+        for row in self.load_pending():
+            item = MemoryCandidate.from_dict(row).to_dict()
+            if secret_shaped(item.get("text", "")):
+                continue
+            normalized_confidence, confidence_score = normalize_confidence(item.get("confidence", "unknown"))
+            item["confidence"] = normalized_confidence
+            item["confidence_score"] = confidence_score
+            item["source_type"] = normalize_source_type(item.get("source_type", ""))
+            item["promotion_score"] = score_pending_candidate(item)
+            if item["promotion_score"] < int(threshold):
+                continue
+            candidates.append(item)
+        candidates.sort(
+            key=lambda item: (
+                int(item.get("promotion_score", 0)),
+                source_type_weight(item.get("source_type", "")),
+                str(item.get("created_at", "")),
+                str(item.get("id", "")),
+            ),
+            reverse=True,
+        )
+        return candidates[:limit_count]
+
+    def promote_pending_candidates(
+        self,
+        limit: int = PENDING_PROMOTION_LIMIT,
+        threshold: int = PENDING_PROMOTION_THRESHOLD,
+    ) -> list[dict]:
+        promoted = []
+        for item in self.select_promotable_pending(limit=limit, threshold=threshold):
+            path = self.promote_candidate(item)
+            promoted.append(
+                {
+                    "id": item["id"],
+                    "topic": item["topic"],
+                    "promotion_score": item["promotion_score"],
+                    "path": _display_memory_path(path, self.workspace_root),
+                }
+            )
+        return promoted
 
     def promote_candidate(self, candidate: MemoryCandidate | dict | str) -> Path:
         rows = self.load_pending()

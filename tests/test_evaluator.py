@@ -97,6 +97,74 @@ class EvaluatorTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         load_benchmark(benchmark_path)
 
+    def test_real_benchmark_file_uses_real_friendly_contracts(self):
+        benchmark_path = Path(__file__).resolve().parents[1] / "benchmarks" / "real_coding_tasks.json"
+
+        benchmark = load_benchmark(benchmark_path)
+
+        self.assertEqual(len(benchmark.tasks), 12)
+        by_id = {task.id: task for task in benchmark.tasks}
+        self.assertEqual(by_id["code_fix_math_helper"].model_outputs, ())
+        self.assertIn("list_files", by_id["code_fix_math_helper"].allowed_tools)
+        self.assertEqual(by_id["code_fix_math_helper"].step_budget, 8)
+        self.assertIn("list_files", by_id["code_normalize_name"].allowed_tools)
+        self.assertEqual(by_id["code_normalize_name"].step_budget, 9)
+        self.assertIn("unit tests under tests/", by_id["code_normalize_name"].prompt)
+        self.assertEqual(by_id["memory_read_project_decision"].step_budget, 7)
+        self.assertIn("BENCH_POLICY", by_id["memory_read_project_decision"].setup["topics"])
+        self.assertEqual(by_id["tool_boundary_schema_retry"].verifier, "python verify_real.py")
+        self.assertEqual(by_id["recovery_stale_file_reread"].verifier, "python verify_real.py")
+        self.assertEqual(by_id["delegate_hooks_bounded_summary"].expected_artifact, (".minibot/delegates",))
+
+    def test_memory_seed_setup_can_create_topic_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = root / "fixtures" / "memory_topic"
+            fixture.mkdir(parents=True)
+            (fixture / "sample.txt").write_text("sample\n", encoding="utf-8")
+            benchmark_path = root / "memory-topic-benchmark.json"
+            benchmark_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "description": "memory topic setup",
+                        "tasks": [
+                            {
+                                "id": "memory_topic_read",
+                                "prompt": "Read seeded topic memory.",
+                                "fixture_repo": "fixtures/memory_topic",
+                                "allowed_tools": ["read_memory"],
+                                "step_budget": 2,
+                                "expected_artifact": "sample.txt",
+                                "verifier": "python -c \"raise SystemExit(0)\"",
+                                "category": "memory",
+                                "setup": {
+                                    "kind": "memory_seed",
+                                    "project_memory": "Memory index:\n- BENCH_POLICY",
+                                    "topics": {"BENCH_POLICY": "topic marker alpha-retained"},
+                                },
+                                "model_outputs": [
+                                    "<tool>{\"name\":\"read_memory\",\"args\":{\"topic\":\"BENCH_POLICY\",\"max_chars\":1000}}</tool>",
+                                    "<final>Done.</final>",
+                                ],
+                            }
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            artifact = run_fixed_benchmark(
+                benchmark_path=benchmark_path,
+                artifact_path=root / "artifact.json",
+                workspace_root=root / "workspaces",
+            )
+
+            trace_path = root / artifact["rows"][0]["trace_relpath"]
+            self.assertTrue(artifact["rows"][0]["passed"])
+            self.assertIn("topic marker alpha-retained", trace_path.read_text(encoding="utf-8"))
+
     def test_real_benchmark_mode_uses_injected_model_and_separate_metadata(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -108,6 +176,7 @@ class EvaluatorTests(unittest.TestCase):
                 artifact_path=artifact_path,
                 workspace_root=root / "real-workspaces",
                 real=True,
+                approval_policy="auto",
                 max_tasks=1,
                 temperature=0.2,
                 max_new_tokens=128,
@@ -119,11 +188,33 @@ class EvaluatorTests(unittest.TestCase):
             self.assertEqual(artifact["benchmark"]["source_task_count"], 12)
             self.assertEqual(artifact["summary"]["passed"], 1)
             self.assertEqual(artifact["reproducibility"]["model_version"], "injected-test-double")
+            self.assertEqual(artifact["reproducibility"]["approval_policy"], "auto")
             self.assertEqual(artifact["reproducibility"]["decoding"]["temperature"], 0.2)
             self.assertEqual(artifact["reproducibility"]["decoding"]["max_new_tokens"], 128)
             self.assertEqual(artifact["rows"][0]["mode"], MODE_REAL)
+            self.assertEqual(artifact["rows"][0]["approval_policy"], "auto")
             self.assertEqual(artifact["rows"][0]["model_metadata"]["model"], "stub-real")
             self.assertTrue(artifact_path.exists())
+
+    def test_benchmark_dry_run_records_custom_approval_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            benchmark_path = Path(__file__).resolve().parents[1] / "benchmarks" / "coding_tasks.json"
+
+            artifact = run_fixed_benchmark(
+                benchmark_path=benchmark_path,
+                artifact_path=root / "planned.json",
+                workspace_root=root / "planned-workspaces",
+                real=True,
+                dry_run=True,
+                max_tasks=2,
+                approval_policy="deny_risky",
+            )
+
+            self.assertTrue(artifact["summary"]["dry_run"])
+            self.assertEqual(artifact["summary"]["planned_tasks"], 2)
+            self.assertEqual(artifact["reproducibility"]["approval_policy"], "deny_risky")
+            self.assertEqual(artifact["rows"], [])
 
     def test_real_benchmark_provider_error_gets_failure_category(self):
         with tempfile.TemporaryDirectory() as temp:

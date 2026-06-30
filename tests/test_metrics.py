@@ -53,7 +53,7 @@ def _sample_harness_artifact() -> dict:
         "captured_at": "2026-06-25T00:00:00+00:00",
         "mode": "mock",
         "benchmark": {"path": "benchmarks/coding_tasks.json", "task_count": 2},
-        "reproducibility": {"mode": "mock", "model_name": "FakeModelClient"},
+        "reproducibility": {"mode": "mock", "model_name": "FakeModelClient", "approval_policy": "auto"},
         "summary": {
             "total_tasks": 2,
             "passed": 1,
@@ -114,6 +114,7 @@ def _sample_real_harness_artifact() -> dict:
             "model": "deepseek-v4-pro",
             "model_name": "deepseek-v4-pro",
             "api_format": "anthropic",
+            "approval_policy": "auto",
         },
         "summary": {
             "total_tasks": 1,
@@ -171,6 +172,7 @@ class MetricsTests(unittest.TestCase):
             self.assertEqual(metrics["category_pass_rates"], {"text-edit": 0.5})
             self.assertEqual(metrics["category_metrics"]["text-edit"]["median_tool_steps"], 4.0)
             self.assertEqual(metrics["failure_category_counts"], {"budget_exceeded": 1})
+            self.assertEqual(metrics["approval_policy"], "auto")
             self.assertEqual(metrics["failed_examples"][0]["id"], "patch_budget_fail")
             self.assertEqual(metrics["failure_examples_by_category"]["text-edit"][0]["id"], "patch_budget_fail")
             self.assertEqual(metrics["path_escape_rejection_count"], 1)
@@ -205,6 +207,8 @@ class MetricsTests(unittest.TestCase):
             self.assertIn("Category Breakdown", report)
             self.assertIn("median_tool_steps", report)
             self.assertIn("category_pass_rates", report)
+            self.assertIn("Approval policy: `auto`", report)
+            self.assertIn("approval_policy", report)
             self.assertIn("Failure examples by category", report)
             self.assertIn("failure_category_counts", report)
             self.assertIn("patch_budget_fail", report)
