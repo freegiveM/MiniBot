@@ -106,10 +106,64 @@ class EvaluatorTests(unittest.TestCase):
         by_id = {task.id: task for task in benchmark.tasks}
         self.assertEqual(by_id["code_fix_math_helper"].model_outputs, ())
         self.assertIn("list_files", by_id["code_fix_math_helper"].allowed_tools)
+        self.assertEqual(by_id["code_fix_math_helper"].step_budget, 8)
         self.assertIn("list_files", by_id["code_normalize_name"].allowed_tools)
+        self.assertEqual(by_id["code_normalize_name"].step_budget, 9)
+        self.assertIn("unit tests under tests/", by_id["code_normalize_name"].prompt)
+        self.assertEqual(by_id["memory_read_project_decision"].step_budget, 7)
+        self.assertIn("BENCH_POLICY", by_id["memory_read_project_decision"].setup["topics"])
         self.assertEqual(by_id["tool_boundary_schema_retry"].verifier, "python verify_real.py")
         self.assertEqual(by_id["recovery_stale_file_reread"].verifier, "python verify_real.py")
         self.assertEqual(by_id["delegate_hooks_bounded_summary"].expected_artifact, (".minibot/delegates",))
+
+    def test_memory_seed_setup_can_create_topic_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = root / "fixtures" / "memory_topic"
+            fixture.mkdir(parents=True)
+            (fixture / "sample.txt").write_text("sample\n", encoding="utf-8")
+            benchmark_path = root / "memory-topic-benchmark.json"
+            benchmark_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "description": "memory topic setup",
+                        "tasks": [
+                            {
+                                "id": "memory_topic_read",
+                                "prompt": "Read seeded topic memory.",
+                                "fixture_repo": "fixtures/memory_topic",
+                                "allowed_tools": ["read_memory"],
+                                "step_budget": 2,
+                                "expected_artifact": "sample.txt",
+                                "verifier": "python -c \"raise SystemExit(0)\"",
+                                "category": "memory",
+                                "setup": {
+                                    "kind": "memory_seed",
+                                    "project_memory": "Memory index:\n- BENCH_POLICY",
+                                    "topics": {"BENCH_POLICY": "topic marker alpha-retained"},
+                                },
+                                "model_outputs": [
+                                    "<tool>{\"name\":\"read_memory\",\"args\":{\"topic\":\"BENCH_POLICY\",\"max_chars\":1000}}</tool>",
+                                    "<final>Done.</final>",
+                                ],
+                            }
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            artifact = run_fixed_benchmark(
+                benchmark_path=benchmark_path,
+                artifact_path=root / "artifact.json",
+                workspace_root=root / "workspaces",
+            )
+
+            trace_path = root / artifact["rows"][0]["trace_relpath"]
+            self.assertTrue(artifact["rows"][0]["passed"])
+            self.assertIn("topic marker alpha-retained", trace_path.read_text(encoding="utf-8"))
 
     def test_real_benchmark_mode_uses_injected_model_and_separate_metadata(self):
         with tempfile.TemporaryDirectory() as temp:

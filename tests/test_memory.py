@@ -15,6 +15,8 @@ from minibot.memory import (
     MiniLLMMemoryIntentDetector,
     MiniLLMMemorySummarizer,
     build_extraction_payload,
+    normalize_confidence,
+    score_pending_candidate,
 )
 from minibot.memory_llm import MemoryLLMExtractionEngine, MemoryModelResolver, MemoryModelSelection
 from minibot.model_providers import API_FORMAT_OPENAI, ProviderConfig
@@ -106,6 +108,59 @@ class MemoryTests(unittest.TestCase):
             self.assertTrue(result["rejected"])
             self.assertEqual(result["rejection_reason"], "secret_shaped")
             self.assertEqual(store.load_pending(), [])
+
+    def test_pending_memory_scoring_normalizes_confidence_and_source_type(self):
+        candidate = MemoryCandidate(
+            text="Always run target tests before full tests",
+            topic="user-preferences",
+            source_type="explicit_user_instruction",
+            confidence="certain",
+        )
+
+        normalized, confidence_score = normalize_confidence(candidate.confidence)
+
+        self.assertEqual(normalized, "unknown")
+        self.assertEqual(confidence_score, 0.0)
+        self.assertEqual(candidate.metadata["schema_warnings"], ["invalid_confidence"])
+        self.assertEqual(score_pending_candidate(candidate.to_dict()), 100)
+
+    def test_memory_store_selects_top_pending_and_promotes_only_topics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = MemoryStore(root)
+            store.write_project_memory("Manual index stays untouched\n")
+            explicit = MemoryCandidate(
+                text="Always run focused tests before full tests",
+                topic="user-preferences",
+                source_type="explicit_user_instruction",
+                confidence="unknown",
+            )
+            verified = MemoryCandidate(
+                text="The formatter unit tests live under tests/",
+                topic="dependency-facts",
+                source_type="tool_verified_fact",
+                confidence="medium",
+            )
+            inferred = MemoryCandidate(
+                text="Maybe the user prefers shorter prompts",
+                topic="task-experience",
+                source_type="assistant_inference",
+                confidence="high",
+            )
+
+            store.append_pending(explicit)
+            store.append_pending(verified)
+            store.append_pending(inferred)
+
+            selected = store.select_promotable_pending()
+            promoted = store.promote_pending_candidates()
+
+            self.assertEqual([item["id"] for item in selected], [explicit.id, verified.id])
+            self.assertEqual([item["promotion_score"] for item in selected], [100, 99])
+            self.assertEqual(len(promoted), 2)
+            self.assertIn("Always run focused tests", store.read_topic("user-preferences"))
+            self.assertIn("formatter unit tests", store.read_topic("dependency-facts"))
+            self.assertEqual(store.load_project_memory(), "Manual index stays untouched\n")
 
     def test_memory_topic_path_cannot_escape_memory_root(self):
         with tempfile.TemporaryDirectory() as temp:

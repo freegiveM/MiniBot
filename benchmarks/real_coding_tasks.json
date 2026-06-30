@@ -44,20 +44,20 @@
     },
     {
       "id": "code_fix_math_helper",
-      "prompt": "Fix the add helper in math_tools.py and run the fixture unit tests. Use list_files for file discovery if needed.",
+      "prompt": "Fix the add helper in math_tools.py and run the unit tests under tests/. Use list_files for file discovery if needed.",
       "fixture_repo": "fixtures/code_math_helper",
       "allowed_tools": ["list_files", "read_file", "patch_file", "run_shell"],
-      "step_budget": 6,
+      "step_budget": 8,
       "expected_artifact": "math_tools.py",
       "verifier": "python -m unittest discover -s tests -v",
       "category": "code-modification"
     },
     {
       "id": "code_normalize_name",
-      "prompt": "Implement normalize_name in formatter.py so it trims, lowercases, and converts spaces to hyphens. Run the fixture tests. Use list_files for file discovery if needed.",
+      "prompt": "Implement normalize_name in formatter.py so it trims, lowercases, and converts spaces to hyphens. Run the unit tests under tests/. Use list_files for file discovery if needed.",
       "fixture_repo": "fixtures/code_formatter",
       "allowed_tools": ["list_files", "read_file", "patch_file", "run_shell"],
-      "step_budget": 6,
+      "step_budget": 9,
       "expected_artifact": "formatter.py",
       "verifier": "python -m unittest discover -s tests -v",
       "category": "code-modification"
@@ -104,13 +104,16 @@
       "prompt": "Use project memory to update notes/decision.txt with the retained decision marker.",
       "fixture_repo": "fixtures/memory_project_decision",
       "allowed_tools": ["read_memory", "read_file", "patch_file"],
-      "step_budget": 5,
+      "step_budget": 7,
       "expected_artifact": "notes/decision.txt",
       "verifier": "python verify.py",
       "category": "memory",
       "setup": {
         "kind": "memory_seed",
-        "project_memory": "Memory index:\n- BENCH_POLICY: use alpha-retained as the decision marker.\n- Guardrail: read project memory before changing decision notes."
+        "project_memory": "Memory index:\n- BENCH_POLICY: use alpha-retained as the decision marker.\n- Guardrail: read project memory before changing decision notes.",
+        "topics": {
+          "BENCH_POLICY": "Use alpha-retained as the decision marker."
+        }
       }
     },
     {

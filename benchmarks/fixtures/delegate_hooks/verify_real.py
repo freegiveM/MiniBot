@@ -18,7 +18,17 @@ assert reports
 report = json.loads(reports[0].read_text(encoding="utf-8"))
 artifact_refs = report.get("delegate_artifacts", [])
 assert artifact_refs
-assert any(Path(ref).name == artifacts[0].name for ref in artifact_refs)
+
+resolved_refs = []
+for ref in artifact_refs:
+    if isinstance(ref, dict):
+        value = str(ref.get("artifact_ref", "")).strip()
+    else:
+        value = str(ref).strip()
+    if value:
+        resolved_refs.append(value)
+assert resolved_refs
+assert any(Path(ref).name == artifacts[0].name for ref in resolved_refs)
 
 trace_text = "\n".join(path.read_text(encoding="utf-8") for path in Path(".minibot/runs").glob("*/trace.jsonl"))
 assert "delegate_artifact" in trace_text

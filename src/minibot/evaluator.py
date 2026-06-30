@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import locale
+import re
 import shutil
 import subprocess
 import time
@@ -592,6 +593,20 @@ def _apply_task_setup(agent: MiniBot, setup: dict) -> None:
         memory_root = agent.root / ".minibot" / "memory"
         memory_root.mkdir(parents=True, exist_ok=True)
         (memory_root / "MEMORY.md").write_text(text + "\n", encoding="utf-8")
+        topics = setup.get("topics", {})
+        if topics:
+            if not isinstance(topics, dict):
+                raise ValueError("setup.topics must be an object")
+            topics_dir = memory_root / "topics"
+            topics_dir.mkdir(parents=True, exist_ok=True)
+            for topic, body in topics.items():
+                topic_name = str(topic).strip()
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", topic_name):
+                    raise ValueError("setup.topics contains an invalid topic name")
+                topic_text = str(body).strip()
+                if not topic_text:
+                    raise ValueError("setup.topics values must be non-empty strings")
+                (topics_dir / f"{topic_name}.md").write_text(topic_text + "\n", encoding="utf-8")
         return
     raise ValueError(f"unsupported benchmark setup kind: {kind}")
 

@@ -171,6 +171,7 @@ class RuntimeHookTests(unittest.TestCase):
             memory_outputs = [output["memory_extraction"] for output in stop_outputs if "memory_extraction" in output]
             self.assertEqual(len(pending), 1)
             self.assertEqual(pending[0]["topic"], "user-preferences")
+            self.assertEqual(pending[0]["source_type"], "assistant_inference")
             self.assertEqual(memory_outputs[0]["candidate_count"], 1)
             self.assertEqual(agent.session["memory_maintenance"]["pending_count"], 1)
 
