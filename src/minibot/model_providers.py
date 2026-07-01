@@ -6,7 +6,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Protocol
 
@@ -46,6 +46,11 @@ API_KEY_ENV_NAME_ENV = "MINIBOT_API_KEY_ENV"
 TIMEOUT_ENV = "MINIBOT_TIMEOUT_SECONDS"
 PROMPT_CACHE_ENV = "MINIBOT_PROMPT_CACHE"
 PROMPT_CACHE_RETENTION_ENV = "MINIBOT_PROMPT_CACHE_RETENTION"
+NATIVE_TOOLS_ENV = "MINIBOT_NATIVE_TOOLS"
+
+NATIVE_TOOLS_AUTO = "auto"
+NATIVE_TOOLS_ON = "on"
+NATIVE_TOOLS_OFF = "off"
 
 
 class ModelProviderError(RuntimeError):
@@ -64,7 +69,7 @@ class ModelClient(Protocol):
     supports_prompt_cache: bool
     last_completion_metadata: dict
 
-    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str | "ModelResponse":
         ...
 
 
@@ -84,6 +89,21 @@ class HTTPResponse:
 
 
 @dataclass(frozen=True)
+class ModelToolCall:
+    name: str
+    args: dict
+    id: str = ""
+
+
+@dataclass(frozen=True)
+class ModelResponse:
+    text: str = ""
+    tool_calls: tuple[ModelToolCall, ...] = ()
+    provider_stop_reason: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class ProviderConfig:
     provider: str = PROVIDER_FAKE
     api_format: str = API_FORMAT_OPENAI
@@ -95,6 +115,7 @@ class ProviderConfig:
     env_file: str = DEFAULT_ENV_FILE
     prompt_cache: str = PROMPT_CACHE_AUTO
     prompt_cache_retention: str = PROMPT_CACHE_RETENTION_IN_MEMORY
+    native_tools: str = NATIVE_TOOLS_AUTO
 
     def safe_metadata(self) -> dict:
         return {
@@ -107,6 +128,7 @@ class ProviderConfig:
             "timeout_seconds": self.timeout_seconds,
             "prompt_cache": self.prompt_cache,
             "prompt_cache_retention": self.prompt_cache_retention,
+            "native_tools": self.native_tools,
         }
 
 
@@ -126,17 +148,19 @@ class HTTPModelClient:
             prompt_cache=config.prompt_cache,
         )
 
-    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str:
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs) -> str | ModelResponse:
         started = time.perf_counter()
         temperature = kwargs.get("temperature")
         prompt_cache_key = str(kwargs.get("prompt_cache_key") or "")
         prompt_cache_retention = str(kwargs.get("prompt_cache_retention") or self.config.prompt_cache_retention)
+        native_tool_schemas = self._native_tool_schemas(kwargs.get("tools"))
         request = self._build_request(
             prompt,
             max_new_tokens,
             temperature=temperature,
             prompt_cache_key=prompt_cache_key,
             prompt_cache_retention=prompt_cache_retention,
+            native_tool_schemas=native_tool_schemas,
         )
         response_status_code = 0
         response_shape: dict = {}
@@ -148,7 +172,21 @@ class HTTPModelClient:
                 raise ModelProviderError(f"provider returned HTTP {response.status_code}: {response.body[:500]}")
             payload = _json_object(response.body)
             response_shape = _response_shape_summary(payload)
-            text, usage = self._parse_payload(payload)
+            parsed = self._parse_payload(payload)
+            text = parsed.text
+            response_metadata = {
+                **dict(parsed.metadata),
+                "native_tools_enabled": bool(native_tool_schemas),
+                "native_tool_schema_count": len(native_tool_schemas),
+                "provider_tool_call_count": len(parsed.tool_calls),
+                "provider_stop_reason": parsed.provider_stop_reason,
+            }
+            parsed = ModelResponse(
+                text=parsed.text,
+                tool_calls=parsed.tool_calls,
+                provider_stop_reason=parsed.provider_stop_reason,
+                metadata=response_metadata,
+            )
             self.last_completion_metadata = {
                 **self.config.safe_metadata(),
                 "request_url": _safe_url_for_metadata(request.url),
@@ -157,13 +195,19 @@ class HTTPModelClient:
                 "output_chars": len(text),
                 "latency_ms": latency_ms,
                 "retry_count": 0,
+                "native_tools_enabled": bool(native_tool_schemas),
+                "native_tool_schema_count": len(native_tool_schemas),
+                "provider_tool_call_count": len(parsed.tool_calls),
+                "provider_stop_reason": parsed.provider_stop_reason,
                 "prompt_cache_supported": self.supports_prompt_cache,
                 "prompt_cache_key": prompt_cache_key if self.supports_prompt_cache else "",
                 "prompt_cache_retention": prompt_cache_retention if self.supports_prompt_cache else "",
                 "status_code": response.status_code,
                 "error_category": "",
-                **usage,
+                **response_metadata,
             }
+            if native_tool_schemas or parsed.tool_calls:
+                return parsed
             return text
         except Exception as exc:
             self.last_completion_metadata = {
@@ -174,6 +218,10 @@ class HTTPModelClient:
                 "output_chars": 0,
                 "latency_ms": int((time.perf_counter() - started) * 1000),
                 "retry_count": 0,
+                "native_tools_enabled": bool(native_tool_schemas),
+                "native_tool_schema_count": len(native_tool_schemas),
+                "provider_tool_call_count": 0,
+                "provider_stop_reason": "",
                 "prompt_cache_supported": self.supports_prompt_cache,
                 "prompt_cache_key": prompt_cache_key if self.supports_prompt_cache else "",
                 "prompt_cache_retention": prompt_cache_retention if self.supports_prompt_cache else "",
@@ -192,6 +240,7 @@ class HTTPModelClient:
         temperature=None,
         prompt_cache_key: str = "",
         prompt_cache_retention: str = PROMPT_CACHE_RETENTION_IN_MEMORY,
+        native_tool_schemas: list[dict] | None = None,
     ) -> HTTPRequest:
         if self.config.api_format == API_FORMAT_OPENAI:
             return self._build_openai_request(
@@ -200,9 +249,15 @@ class HTTPModelClient:
                 temperature=temperature,
                 prompt_cache_key=prompt_cache_key,
                 prompt_cache_retention=prompt_cache_retention,
+                native_tool_schemas=native_tool_schemas,
             )
         if self.config.api_format == API_FORMAT_ANTHROPIC:
-            return self._build_anthropic_request(prompt, max_new_tokens, temperature=temperature)
+            return self._build_anthropic_request(
+                prompt,
+                max_new_tokens,
+                temperature=temperature,
+                native_tool_schemas=native_tool_schemas,
+            )
         raise ProviderConfigurationError(f"unsupported api_format: {self.config.api_format}")
 
     def _build_openai_request(
@@ -213,12 +268,16 @@ class HTTPModelClient:
         temperature=None,
         prompt_cache_key: str = "",
         prompt_cache_retention: str = PROMPT_CACHE_RETENTION_IN_MEMORY,
+        native_tool_schemas: list[dict] | None = None,
     ) -> HTTPRequest:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": int(max_new_tokens),
         }
+        if native_tool_schemas:
+            payload["tools"] = native_tool_schemas
+            payload["tool_choice"] = "auto"
         if self.supports_prompt_cache and prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
             payload["prompt_cache_retention"] = normalize_prompt_cache_retention(prompt_cache_retention)
@@ -236,12 +295,21 @@ class HTTPModelClient:
             timeout=self.config.timeout_seconds,
         )
 
-    def _build_anthropic_request(self, prompt: str, max_new_tokens: int, *, temperature=None) -> HTTPRequest:
+    def _build_anthropic_request(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        *,
+        temperature=None,
+        native_tool_schemas: list[dict] | None = None,
+    ) -> HTTPRequest:
         payload = {
             "model": self.config.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": int(max_new_tokens),
         }
+        if native_tool_schemas:
+            payload["tools"] = native_tool_schemas
         if _is_deepseek_endpoint(self.config):
             payload["thinking"] = {"type": "disabled"}
         if temperature is not None:
@@ -257,12 +325,20 @@ class HTTPModelClient:
             timeout=self.config.timeout_seconds,
         )
 
-    def _parse_payload(self, payload: dict) -> tuple[str, dict]:
+    def _parse_payload(self, payload: dict) -> ModelResponse:
         if self.config.api_format == API_FORMAT_OPENAI:
             return _parse_openai_chat_response(payload)
         if self.config.api_format == API_FORMAT_ANTHROPIC:
             return _parse_anthropic_messages_response(payload)
         raise ProviderConfigurationError(f"unsupported api_format: {self.config.api_format}")
+
+    def _native_tool_schemas(self, tools) -> list[dict]:
+        if tools is None or self.config.native_tools == NATIVE_TOOLS_OFF:
+            return []
+        schemas = _provider_tool_schemas(tools, self.config.api_format)
+        if self.config.native_tools == NATIVE_TOOLS_ON and not schemas:
+            raise ProviderConfigurationError("native tools are enabled but no tool schemas were available")
+        return schemas
 
 
 def load_dotenv(path: str | Path) -> dict[str, str]:
@@ -299,6 +375,7 @@ def resolve_provider_config(
     timeout_seconds: float | str | None = None,
     prompt_cache: str | None = None,
     prompt_cache_retention: str | None = None,
+    native_tools: str | None = None,
 ) -> ProviderConfig:
     cwd_path = Path(cwd).resolve()
     env_file_path = Path(env_file)
@@ -321,6 +398,7 @@ def resolve_provider_config(
     resolved_prompt_cache_retention = _prompt_cache_retention(
         _coalesce(prompt_cache_retention, merged.get(PROMPT_CACHE_RETENTION_ENV), PROMPT_CACHE_RETENTION_IN_MEMORY)
     )
+    resolved_native_tools = _native_tools_mode(_coalesce(native_tools, merged.get(NATIVE_TOOLS_ENV), NATIVE_TOOLS_AUTO))
 
     config = ProviderConfig(
         provider=provider,
@@ -333,6 +411,7 @@ def resolve_provider_config(
         env_file=str(env_file_path),
         prompt_cache=resolved_prompt_cache,
         prompt_cache_retention=resolved_prompt_cache_retention,
+        native_tools=resolved_native_tools,
     )
     _validate_provider_config(config)
     return config
@@ -349,7 +428,7 @@ def build_model_client_from_config(
     return HTTPModelClient(config, transport=transport)
 
 
-def _parse_openai_chat_response(payload: dict) -> tuple[str, dict]:
+def _parse_openai_chat_response(payload: dict) -> ModelResponse:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ProviderResponseError("OpenAI-compatible response missing choices")
@@ -357,42 +436,64 @@ def _parse_openai_chat_response(payload: dict) -> tuple[str, dict]:
     if not isinstance(choice, dict):
         raise ProviderResponseError("OpenAI-compatible choice must be an object")
     message = choice.get("message", {})
+    tool_calls: list[ModelToolCall] = []
     if isinstance(message, dict):
         content = _content_to_text(message.get("content"))
+        tool_calls = _parse_openai_tool_calls(message.get("tool_calls"))
     else:
         content = ""
     if not content and "text" in choice:
         content = _content_to_text(choice.get("text"))
-    if not content:
+    if not content and not tool_calls:
         raise ProviderResponseError("OpenAI-compatible response missing message content")
     usage = payload.get("usage", {})
-    return content, _usage_metadata(
+    provider_stop_reason = str(choice.get("finish_reason") or "")
+    return ModelResponse(
+        text=content,
+        tool_calls=tuple(tool_calls),
+        provider_stop_reason=provider_stop_reason,
+        metadata=_usage_metadata(
         input_tokens=usage.get("prompt_tokens") if isinstance(usage, dict) else None,
         output_tokens=usage.get("completion_tokens") if isinstance(usage, dict) else None,
         total_tokens=usage.get("total_tokens") if isinstance(usage, dict) else None,
         cached_tokens=_cached_tokens_from_usage(usage) if isinstance(usage, dict) else None,
+        ),
     )
 
 
-def _parse_anthropic_messages_response(payload: dict) -> tuple[str, dict]:
+def _parse_anthropic_messages_response(payload: dict) -> ModelResponse:
     blocks = payload.get("content")
     if not isinstance(blocks, list):
         raise ProviderResponseError("Anthropic-compatible response missing content blocks")
-    text = "\n".join(
-        str(block.get("text") or block.get("content") or "")
-        for block in blocks
-        if isinstance(block, dict)
-        and (block.get("type") in ("text", None, "") or block.get("text") or block.get("content"))
-        and (block.get("text") or block.get("content"))
-    ).strip()
-    if not text:
+    text_parts: list[str] = []
+    tool_calls: list[ModelToolCall] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "tool_use":
+            tool_calls.append(_parse_anthropic_tool_use(block))
+            continue
+        if block_type == "thinking":
+            continue
+        text = block.get("text") or block.get("content")
+        if text:
+            text_parts.append(str(text))
+    text = "\n".join(text_parts).strip()
+    if not text and not tool_calls:
         shape = _response_shape_summary(payload)
         raise ProviderResponseError(f"Anthropic-compatible response missing text content; shape={shape}")
     usage = payload.get("usage", {})
-    return text, _usage_metadata(
+    provider_stop_reason = str(payload.get("stop_reason") or "")
+    return ModelResponse(
+        text=text,
+        tool_calls=tuple(tool_calls),
+        provider_stop_reason=provider_stop_reason,
+        metadata=_usage_metadata(
         input_tokens=usage.get("input_tokens") if isinstance(usage, dict) else None,
         output_tokens=usage.get("output_tokens") if isinstance(usage, dict) else None,
         cached_tokens=_cached_tokens_from_usage(usage) if isinstance(usage, dict) else None,
+        ),
     )
 
 
@@ -464,6 +565,133 @@ def _content_to_text(content) -> str:
     return ""
 
 
+def _provider_tool_schemas(tools, api_format: str) -> list[dict]:
+    if tools is None:
+        return []
+    if hasattr(tools, "items"):
+        raw_items = list(tools.items())
+    elif isinstance(tools, dict):
+        raw_items = list(tools.items())
+    else:
+        return []
+
+    schemas = []
+    for name, spec in sorted(raw_items, key=lambda item: str(item[0])):
+        tool_name = str(getattr(spec, "name", "") or name).strip()
+        if not tool_name:
+            continue
+        description = str(getattr(spec, "description", "") or "")
+        parameters = _minibot_args_schema_to_json_schema(getattr(spec, "schema", {}) or {})
+        if api_format == API_FORMAT_OPENAI:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": description,
+                        "parameters": parameters,
+                    },
+                }
+            )
+        elif api_format == API_FORMAT_ANTHROPIC:
+            schemas.append(
+                {
+                    "name": tool_name,
+                    "description": description,
+                    "input_schema": parameters,
+                }
+            )
+    return schemas
+
+
+def _minibot_args_schema_to_json_schema(schema: dict) -> dict:
+    if not isinstance(schema, dict):
+        raise ProviderConfigurationError("tool schema must be an object")
+    properties = {}
+    required = []
+    for key, descriptor in sorted(schema.items()):
+        if not isinstance(key, str) or not key:
+            raise ProviderConfigurationError("tool schema keys must be non-empty strings")
+        text = str(descriptor)
+        kind = text.split("=", 1)[0].strip()
+        is_required = "=" not in text
+        json_type = _json_schema_type(kind)
+        prop = {
+            "type": json_type,
+            "description": f"Argument `{key}` for this MiniBot tool.",
+        }
+        if json_type == "array":
+            prop["items"] = {}
+        properties[key] = prop
+        if is_required:
+            required.append(key)
+    result = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        result["required"] = required
+    return result
+
+
+def _json_schema_type(kind: str) -> str:
+    mapping = {
+        "str": "string",
+        "int": "integer",
+        "bool": "boolean",
+        "list": "array",
+    }
+    try:
+        return mapping[kind]
+    except KeyError as exc:
+        raise ProviderConfigurationError(f"unsupported tool arg descriptor: {kind}") from exc
+
+
+def _parse_openai_tool_calls(raw_tool_calls) -> list[ModelToolCall]:
+    if raw_tool_calls in (None, ""):
+        return []
+    if not isinstance(raw_tool_calls, list):
+        raise ProviderResponseError("OpenAI-compatible tool_calls must be a list")
+    calls = []
+    for index, item in enumerate(raw_tool_calls):
+        if not isinstance(item, dict):
+            raise ProviderResponseError(f"OpenAI-compatible tool_call at index {index} must be an object")
+        function = item.get("function")
+        if not isinstance(function, dict):
+            raise ProviderResponseError(f"OpenAI-compatible tool_call at index {index} missing function")
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ProviderResponseError(f"OpenAI-compatible tool_call at index {index} missing function name")
+        args = _tool_args_object(function.get("arguments"), provider="OpenAI-compatible", index=index)
+        calls.append(ModelToolCall(name=name.strip(), args=args, id=str(item.get("id") or "")))
+    return calls
+
+
+def _parse_anthropic_tool_use(block: dict) -> ModelToolCall:
+    name = block.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ProviderResponseError("Anthropic-compatible tool_use missing name")
+    args = _tool_args_object(block.get("input", block.get("args", {})), provider="Anthropic-compatible", index=0)
+    return ModelToolCall(name=name.strip(), args=args, id=str(block.get("id") or ""))
+
+
+def _tool_args_object(raw_args, *, provider: str, index: int) -> dict:
+    if raw_args in (None, ""):
+        return {}
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if isinstance(raw_args, str):
+        try:
+            parsed = json.loads(raw_args)
+        except json.JSONDecodeError as exc:
+            raise ProviderResponseError(f"{provider} tool arguments at index {index} were not valid JSON: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ProviderResponseError(f"{provider} tool arguments at index {index} must be an object")
+        return parsed
+    raise ProviderResponseError(f"{provider} tool arguments at index {index} must be an object")
+
+
 def _response_shape_summary(payload: dict) -> dict:
     summary: dict = {"top_level_keys": sorted(str(key) for key in payload.keys())[:20]}
     if "content" in payload:
@@ -475,6 +703,9 @@ def _response_shape_summary(payload: dict) -> dict:
                 str(block.get("type", ""))[:80] if isinstance(block, dict) else type(block).__name__
                 for block in content[:8]
             ]
+            summary["content_tool_use_count"] = sum(
+                1 for block in content if isinstance(block, dict) and block.get("type") == "tool_use"
+            )
             summary["content_block_keys"] = [
                 sorted(str(key) for key in block.keys())[:12] if isinstance(block, dict) else []
                 for block in content[:8]
@@ -493,6 +724,8 @@ def _response_shape_summary(payload: dict) -> dict:
             if isinstance(message, dict):
                 summary["message_keys"] = sorted(str(key) for key in message.keys())[:12]
                 summary["message_content_type"] = type(message.get("content")).__name__
+                tool_calls = message.get("tool_calls")
+                summary["message_tool_call_count"] = len(tool_calls) if isinstance(tool_calls, list) else 0
     error = payload.get("error")
     if isinstance(error, dict):
         summary["error_keys"] = sorted(str(key) for key in error.keys())[:12]
@@ -659,6 +892,13 @@ def _prompt_cache_retention(value: str) -> str:
         return normalize_prompt_cache_retention(value)
     except ValueError as exc:
         raise ProviderConfigurationError(str(exc)) from exc
+
+
+def _native_tools_mode(value: str) -> str:
+    mode = str(value or NATIVE_TOOLS_AUTO).strip().lower()
+    if mode not in {NATIVE_TOOLS_AUTO, NATIVE_TOOLS_ON, NATIVE_TOOLS_OFF}:
+        raise ProviderConfigurationError(f"unsupported native tools mode: {value}")
+    return mode
 
 
 def _error_category(exc: Exception) -> str:

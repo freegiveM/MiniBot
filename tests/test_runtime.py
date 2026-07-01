@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from minibot import FakeModelClient, MiniBot, SessionStore, WorkspaceContext
 from minibot.context_manager import ContextManager
-from minibot.model_providers import API_FORMAT_OPENAI, ProviderConfig
+from minibot.model_providers import API_FORMAT_OPENAI, ModelResponse, ModelToolCall, ProviderConfig
 from minibot.runtime import SESSION_TOOL_OBSERVATION_LIMIT
 from minibot.task_state import (
     STATUS_COMPLETED,
@@ -57,6 +57,36 @@ class CacheAwareModelClient:
             "cache_hit": True,
         }
         return "<final>Cache done.</final>"
+
+
+class NativeToolModelClient:
+    supports_prompt_cache = False
+
+    def __init__(self):
+        self.outputs = [
+            ModelResponse(
+                tool_calls=(ModelToolCall(name="read_file", args={"path": "README.md", "start": 1, "end": 2}, id="call_1"),),
+                provider_stop_reason="tool_calls",
+                metadata={"native_tools_enabled": True},
+            ),
+            ModelResponse(
+                text="Native tool call completed.",
+                provider_stop_reason="end_turn",
+                metadata={"native_tools_enabled": True},
+            ),
+        ]
+        self.calls: list[dict] = []
+        self.last_completion_metadata = {}
+        self.model = "native-tool-test"
+
+    def complete(self, prompt: str, max_new_tokens: int, **kwargs):
+        self.calls.append({"prompt": prompt, "max_new_tokens": max_new_tokens, "kwargs": dict(kwargs)})
+        output = self.outputs.pop(0)
+        self.last_completion_metadata = {
+            "model": self.model,
+            "provider_tool_call_count": len(output.tool_calls) if isinstance(output, ModelResponse) else 0,
+        }
+        return output
 
 
 class RuntimeTests(unittest.TestCase):
@@ -160,6 +190,33 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual([event["args"]["path"] for event in tool_events], ["a.py", "b.py"])
             self.assertEqual([item["role"] for item in saved["history"]], ["user", "assistant", "tool", "tool", "assistant"])
 
+    def test_runtime_executes_provider_native_tool_call(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("# Demo\nnative marker\n", encoding="utf-8")
+            model = NativeToolModelClient()
+            workspace = WorkspaceContext.build(root)
+            agent = MiniBot(
+                model_client=model,
+                workspace=workspace,
+                session_store=SessionStore(root / ".minibot" / "sessions"),
+                approval_policy="auto",
+            )
+
+            self.assertEqual(agent.ask("read README"), "Native tool call completed.")
+
+            self.assertIn("tools", model.calls[0]["kwargs"])
+            run_id = agent.session["runs"]["last_run_id"]
+            state = self.load_task_state(root, run_id)
+            events = self.load_trace_events(root, run_id)
+            parsed_events = [event for event in events if event["event"] == "model_parsed"]
+            tool_events = [event for event in events if event["event"] == "tool_executed"]
+            saved = agent.session_store.load(agent.session["id"])
+            self.assertEqual(state["tool_steps"], 1)
+            self.assertEqual(tool_events[0]["name"], "read_file")
+            self.assertEqual(parsed_events[0]["provider_tool_call_count"], 1)
+            self.assertIn("<provider_tool_calls>", saved["history"][1]["content"])
+
     def test_runtime_stops_when_step_budget_is_reached(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -176,6 +233,22 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(state["stop_reason"], STOP_REASON_STEP_LIMIT_REACHED)
             self.assertEqual(state["tool_steps"], 1)
             self.assertEqual(state["last_tool"], "list_files")
+
+    def test_runtime_retries_plain_text_without_action_tag(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = self.build_agent(root, ["I'll start by reading README.md.", "<final>Recovered.</final>"])
+
+            self.assertEqual(agent.ask("read README"), "Recovered.")
+
+            run_id = agent.session["runs"]["last_run_id"]
+            events = self.load_trace_events(root, run_id)
+            parsed_events = [event for event in events if event["event"] == "model_parsed"]
+            saved = agent.session_store.load(agent.session["id"])
+            self.assertEqual(parsed_events[0]["kind"], "retry")
+            self.assertEqual(saved["history"][1]["decision"], "retry")
+            self.assertIn("missing action tag", saved["history"][1]["parse_error"])
 
     def test_runtime_marks_model_exception_as_failed(self):
         with tempfile.TemporaryDirectory() as temp:
