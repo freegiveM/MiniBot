@@ -18,6 +18,7 @@ from .hooks import (
     HookManager,
     build_default_hook_manager,
 )
+from .model_providers import ModelResponse
 from .permission import (
     ACTION_ALLOW,
     ACTION_ASK,
@@ -89,6 +90,7 @@ class MiniBot:
         shell_env_allowlist: tuple[str, ...] | None = None,
         hook_manager: HookManager | None = None,
         recovery_policy: RecoveryPolicy | None = None,
+        strict_action_protocol: bool = True,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -102,6 +104,7 @@ class MiniBot:
         self.max_depth = int(max_depth)
         self.read_only = bool(read_only)
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
+        self.strict_action_protocol = bool(strict_action_protocol)
         self.session = session or self._new_session()
         self._ensure_session_shape()
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
@@ -393,7 +396,7 @@ class MiniBot:
             cache_kwargs = self._prompt_cache_kwargs(prompt_metadata)
             self.emit_trace(task_state, "model_requested", self._model_requested_metadata(prompt_metadata, cache_kwargs))
             try:
-                raw = self.model_client.complete(prompt, self.max_new_tokens, **cache_kwargs)
+                raw = self.model_client.complete(prompt, self.max_new_tokens, tools=self.tools, **cache_kwargs)
             except Exception as exc:
                 self._record_prompt_cache_result(prompt_metadata)
                 self._model_error_retries += 1
@@ -417,11 +420,21 @@ class MiniBot:
                     "model": self._model_report(),
                 },
             )
-            kind, payload = self.parse(raw)
-            self.emit_trace(task_state, "model_parsed", {"kind": kind})
+            response = self._normalize_model_response(raw)
+            raw_text = self._response_record_text(response)
+            kind, payload = self.parse_response(response, strict_action_protocol=self.strict_action_protocol)
+            self.emit_trace(
+                task_state,
+                "model_parsed",
+                {
+                    "kind": kind,
+                    "provider_tool_call_count": len(response.tool_calls),
+                    "text_protocol_action": kind if not response.tool_calls else "",
+                },
+            )
 
             if kind == "tool":
-                self._record_assistant_decision(raw, kind, payload)
+                self._record_assistant_decision(raw_text, kind, payload)
                 for call in payload:
                     if task_state.tool_steps >= self.max_steps:
                         break
@@ -448,11 +461,11 @@ class MiniBot:
                 continue
 
             if kind == "retry":
-                self._record_assistant_decision(raw, kind, payload)
+                self._record_assistant_decision(raw_text, kind, payload)
                 self.run_store.write_task_state(task_state)
                 continue
 
-            final = str(payload or raw).strip()
+            final = str(payload or raw_text).strip()
             return self._finish_run_success(task_state, final)
 
         final = (
@@ -705,7 +718,34 @@ class MiniBot:
         }
 
     @staticmethod
-    def parse(raw: str) -> tuple[str, object]:
+    def _normalize_model_response(raw) -> ModelResponse:
+        if isinstance(raw, ModelResponse):
+            return raw
+        return ModelResponse(text=str(raw or ""))
+
+    @staticmethod
+    def _response_record_text(response: ModelResponse) -> str:
+        text = str(response.text or "").strip()
+        if text:
+            return text
+        if response.tool_calls:
+            calls = [
+                {"name": call.name, "args": dict(call.args), "id": call.id}
+                for call in response.tool_calls
+            ]
+            return "<provider_tool_calls>" + json.dumps(calls, ensure_ascii=False, sort_keys=True) + "</provider_tool_calls>"
+        return ""
+
+    @staticmethod
+    def parse_response(response: ModelResponse, *, strict_action_protocol: bool = True) -> tuple[str, object]:
+        if response.tool_calls:
+            return "tool", toolkit.normalize_tool_calls(
+                [{"name": call.name, "args": dict(call.args)} for call in response.tool_calls]
+            )
+        return MiniBot.parse(response.text, strict_action_protocol=strict_action_protocol)
+
+    @staticmethod
+    def parse(raw: str, *, strict_action_protocol: bool = True) -> tuple[str, object]:
         text = str(raw or "").strip()
         tool_match = re.search(r"<tool>(.*?)</tool>", text, re.S)
         if tool_match:
@@ -717,4 +757,9 @@ class MiniBot:
         final_match = re.search(r"<final>(.*?)</final>", text, re.S)
         if final_match:
             return "final", final_match.group(1).strip()
+        if strict_action_protocol:
+            return (
+                "retry",
+                "missing action tag: use exactly one <tool>...</tool> or <final>...</final> response",
+            )
         return "final", text

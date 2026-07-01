@@ -313,6 +313,7 @@ class DelegateScheduler:
             max_depth=parent_agent.depth + 1,
             read_only=task.read_only,
             hook_manager=HookManager(),
+            strict_action_protocol=False,
         )
         child.tools = filter_tool_registry(child.tools, task.allowed_tools)
         child.prefix = child.build_prefix()

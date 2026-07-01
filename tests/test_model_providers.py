@@ -13,6 +13,7 @@ from minibot.model_providers import (
     API_FORMAT_OPENAI,
     HTTPModelClient,
     HTTPResponse,
+    ModelResponse,
     ProviderConfig,
     ProviderConfigurationError,
     ProviderResponseError,
@@ -22,6 +23,7 @@ from minibot.model_providers import (
     resolve_provider_config,
 )
 from minibot.models import FakeModelClient
+from minibot.tools import BASE_TOOL_SPECS
 
 
 class ModelProviderTests(unittest.TestCase):
@@ -62,6 +64,7 @@ class ModelProviderTests(unittest.TestCase):
                         "CUSTOM_KEY=dotenv-key",
                         "MINIBOT_PROMPT_CACHE=openai_explicit",
                         "MINIBOT_PROMPT_CACHE_RETENTION=24h",
+                        "MINIBOT_NATIVE_TOOLS=off",
                     ]
                 ),
                 encoding="utf-8",
@@ -82,6 +85,7 @@ class ModelProviderTests(unittest.TestCase):
             self.assertEqual(config.api_key_env, "CUSTOM_KEY")
             self.assertEqual(config.prompt_cache, "openai_explicit")
             self.assertEqual(config.prompt_cache_retention, "24h")
+            self.assertEqual(config.native_tools, "off")
 
     def test_resolve_provider_config_defaults_deepseek_base_url_by_api_format(self):
         openai_config = resolve_provider_config(
@@ -179,6 +183,69 @@ class ModelProviderTests(unittest.TestCase):
         self.assertTrue(client.last_completion_metadata["api_key_present"])
         self.assertNotIn("secret", json.dumps(client.last_completion_metadata))
 
+    def test_http_model_client_sends_and_parses_openai_native_tool_calls(self):
+        captured = []
+
+        def transport(request):
+            captured.append(request)
+            return HTTPResponse(
+                200,
+                json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "finish_reason": "tool_calls",
+                                "message": {
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": "{\"path\":\"README.md\",\"start\":1,\"end\":3}",
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7},
+                    }
+                ),
+            )
+
+        client = HTTPModelClient(
+            ProviderConfig(
+                provider="http",
+                api_format=API_FORMAT_OPENAI,
+                model_name="mini",
+                base_url="https://example.test/chat",
+                api_key="secret",
+            ),
+            transport=transport,
+        )
+
+        response = client.complete("hello", 32, tools=BASE_TOOL_SPECS)
+
+        self.assertIsInstance(response, ModelResponse)
+        self.assertEqual(response.tool_calls[0].name, "read_file")
+        self.assertEqual(response.tool_calls[0].args, {"path": "README.md", "start": 1, "end": 3})
+        self.assertEqual(response.tool_calls[0].id, "call_1")
+        self.assertEqual(response.provider_stop_reason, "tool_calls")
+        request_payload = json.loads(captured[0].body)
+        self.assertEqual(request_payload["tool_choice"], "auto")
+        read_file_schema = [
+            item for item in request_payload["tools"] if item["function"]["name"] == "read_file"
+        ][0]["function"]["parameters"]
+        self.assertEqual(read_file_schema["properties"]["path"]["type"], "string")
+        self.assertIn("path", read_file_schema["required"])
+        self.assertEqual(read_file_schema["properties"]["start"]["type"], "integer")
+        self.assertNotIn("start", read_file_schema["required"])
+        self.assertEqual(client.last_completion_metadata["native_tool_schema_count"], len(BASE_TOOL_SPECS))
+        self.assertEqual(client.last_completion_metadata["provider_tool_call_count"], 1)
+        self.assertEqual(client.last_completion_metadata["response_shape"]["message_tool_call_count"], 1)
+
     def test_http_model_client_normalizes_openai_base_urls(self):
         captured = []
 
@@ -254,6 +321,59 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(client.last_completion_metadata["api_format"], API_FORMAT_ANTHROPIC)
         self.assertEqual(client.last_completion_metadata["request_url"], "https://example.test/messages")
         self.assertEqual(client.last_completion_metadata["total_tokens"], 11)
+
+    def test_http_model_client_sends_and_parses_anthropic_native_tool_use(self):
+        captured = []
+
+        def transport(request):
+            captured.append(request)
+            return HTTPResponse(
+                200,
+                json.dumps(
+                    {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "patch_file",
+                                "input": {
+                                    "path": "README.md",
+                                    "old_text": "Status: draft",
+                                    "new_text": "Status: reviewed",
+                                },
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                        "usage": {"input_tokens": 5, "output_tokens": 6},
+                    }
+                ),
+            )
+
+        client = HTTPModelClient(
+            ProviderConfig(
+                provider="anthropic",
+                api_format=API_FORMAT_ANTHROPIC,
+                model_name="claude-mini",
+                base_url="https://example.test/messages",
+                api_key="secret",
+            ),
+            transport=transport,
+        )
+
+        response = client.complete("hello", 16, tools=BASE_TOOL_SPECS)
+
+        self.assertIsInstance(response, ModelResponse)
+        self.assertEqual(response.tool_calls[0].name, "patch_file")
+        self.assertEqual(response.tool_calls[0].args["path"], "README.md")
+        self.assertEqual(response.tool_calls[0].id, "toolu_1")
+        self.assertEqual(response.provider_stop_reason, "tool_use")
+        request_payload = json.loads(captured[0].body)
+        patch_schema = [item for item in request_payload["tools"] if item["name"] == "patch_file"][0]["input_schema"]
+        self.assertEqual(patch_schema["properties"]["new_text"]["type"], "string")
+        self.assertIn("new_text", patch_schema["required"])
+        self.assertEqual(client.last_completion_metadata["native_tool_schema_count"], len(BASE_TOOL_SPECS))
+        self.assertEqual(client.last_completion_metadata["provider_tool_call_count"], 1)
+        self.assertEqual(client.last_completion_metadata["response_shape"]["content_tool_use_count"], 1)
 
     def test_http_model_client_normalizes_deepseek_anthropic_base_url(self):
         captured = []
