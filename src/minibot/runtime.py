@@ -428,6 +428,7 @@ class MiniBot:
                 "model_parsed",
                 {
                     "kind": kind,
+                    "native_tools_enabled": bool(response.metadata.get("native_tools_enabled")),
                     "provider_tool_call_count": len(response.tool_calls),
                     "text_protocol_action": kind if not response.tool_calls else "",
                 },
@@ -742,7 +743,8 @@ class MiniBot:
             return "tool", toolkit.normalize_tool_calls(
                 [{"name": call.name, "args": dict(call.args)} for call in response.tool_calls]
             )
-        return MiniBot.parse(response.text, strict_action_protocol=strict_action_protocol)
+        native_text_final = bool(response.metadata.get("native_tools_enabled"))
+        return MiniBot.parse(response.text, strict_action_protocol=strict_action_protocol and not native_text_final)
 
     @staticmethod
     def parse(raw: str, *, strict_action_protocol: bool = True) -> tuple[str, object]:

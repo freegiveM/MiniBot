@@ -322,6 +322,43 @@ class ModelProviderTests(unittest.TestCase):
         self.assertEqual(client.last_completion_metadata["request_url"], "https://example.test/messages")
         self.assertEqual(client.last_completion_metadata["total_tokens"], 11)
 
+    def test_http_model_client_returns_native_metadata_for_text_final(self):
+        captured = []
+
+        def transport(request):
+            captured.append(request)
+            return HTTPResponse(
+                200,
+                json.dumps(
+                    {
+                        "content": [{"type": "text", "text": "plain final from provider"}],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 5, "output_tokens": 6},
+                    }
+                ),
+            )
+
+        client = HTTPModelClient(
+            ProviderConfig(
+                provider="anthropic",
+                api_format=API_FORMAT_ANTHROPIC,
+                model_name="claude-mini",
+                base_url="https://example.test/messages",
+                api_key="secret",
+            ),
+            transport=transport,
+        )
+
+        response = client.complete("hello", 16, tools=BASE_TOOL_SPECS)
+
+        self.assertIsInstance(response, ModelResponse)
+        self.assertEqual(response.text, "plain final from provider")
+        self.assertTrue(response.metadata["native_tools_enabled"])
+        self.assertEqual(response.metadata["native_tool_schema_count"], len(BASE_TOOL_SPECS))
+        self.assertEqual(response.metadata["provider_tool_call_count"], 0)
+        self.assertEqual(response.provider_stop_reason, "end_turn")
+        self.assertIn("tools", json.loads(captured[0].body))
+
     def test_http_model_client_sends_and_parses_anthropic_native_tool_use(self):
         captured = []
 

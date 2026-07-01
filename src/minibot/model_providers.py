@@ -174,7 +174,19 @@ class HTTPModelClient:
             response_shape = _response_shape_summary(payload)
             parsed = self._parse_payload(payload)
             text = parsed.text
-            usage = dict(parsed.metadata)
+            response_metadata = {
+                **dict(parsed.metadata),
+                "native_tools_enabled": bool(native_tool_schemas),
+                "native_tool_schema_count": len(native_tool_schemas),
+                "provider_tool_call_count": len(parsed.tool_calls),
+                "provider_stop_reason": parsed.provider_stop_reason,
+            }
+            parsed = ModelResponse(
+                text=parsed.text,
+                tool_calls=parsed.tool_calls,
+                provider_stop_reason=parsed.provider_stop_reason,
+                metadata=response_metadata,
+            )
             self.last_completion_metadata = {
                 **self.config.safe_metadata(),
                 "request_url": _safe_url_for_metadata(request.url),
@@ -192,7 +204,7 @@ class HTTPModelClient:
                 "prompt_cache_retention": prompt_cache_retention if self.supports_prompt_cache else "",
                 "status_code": response.status_code,
                 "error_category": "",
-                **usage,
+                **response_metadata,
             }
             if native_tool_schemas or parsed.tool_calls:
                 return parsed

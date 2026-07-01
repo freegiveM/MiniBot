@@ -67,8 +67,13 @@ class NativeToolModelClient:
             ModelResponse(
                 tool_calls=(ModelToolCall(name="read_file", args={"path": "README.md", "start": 1, "end": 2}, id="call_1"),),
                 provider_stop_reason="tool_calls",
+                metadata={"native_tools_enabled": True},
             ),
-            "<final>Native tool call completed.</final>",
+            ModelResponse(
+                text="Native tool call completed.",
+                provider_stop_reason="end_turn",
+                metadata={"native_tools_enabled": True},
+            ),
         ]
         self.calls: list[dict] = []
         self.last_completion_metadata = {}
